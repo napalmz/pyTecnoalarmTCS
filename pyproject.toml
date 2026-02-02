@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytecnoalarm-tcs"
+version = "0.1.0"
+description = "Async Python library for controlling Tecnoalarm Evolution alarm systems via TCS API"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Willy Baessato", email = "willy.baessato@gmail.com"}
+]
+keywords = ["tecnoalarm", "tcs", "alarm", "async", "api"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Italian",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "aiohttp>=3.8.0",
+    "cryptography>=41.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.20.0",
+    "black>=22.0",
+    "flake8>=4.0",
+    "mypy>=0.990",
+]
+
+[project.urls]
+Homepage = "https://github.com/napalmz/pyTecnoalarmTCS"
+Documentation = "https://github.com/napalmz/pyTecnoalarmTCS/blob/main/README.md"
+Repository = "https://github.com/napalmz/pyTecnoalarmTCS.git"
+Issues = "https://github.com/napalmz/pyTecnoalarmTCS/issues"
+
+[tool.setuptools]
+packages = ["pyTecnoalarm_TCS"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+pyTecnoalarm_TCS = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
