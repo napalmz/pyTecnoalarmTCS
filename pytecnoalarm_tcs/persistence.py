@@ -42,7 +42,7 @@ class SessionPersistence:
     ):
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(exist_ok=True)
-        self.session_file = self.storage_dir / "session.json"
+        # Note: session_file is now dynamic based on email - see _get_session_file()
         
         # Setup encryption
         self._fernet = None
@@ -55,6 +55,12 @@ class SessionPersistence:
                     # Generate machine-specific key
                     self._fernet = Fernet(self._get_machine_key())
             # If crypto not available, silently fall back to plaintext
+    
+    def _get_session_file(self, email: str) -> Path:
+        """Get session file path for a specific email."""
+        # Sanitize email for filename (replace @ and . with _)
+        sanitized = email.replace("@", "_").replace(".", "_")
+        return self.storage_dir / f"session_{sanitized}.json"
     
     def _get_machine_key(self) -> bytes:
         """Generate a machine-specific encryption key."""
@@ -93,7 +99,7 @@ class SessionPersistence:
         
         Args:
             session: TecnoalarmSession instance
-            email: User email (used as identifier)
+            email: User email (used as identifier and filename)
             password_hash: Optional password hash
         """
         # Encrypt sensitive fields
@@ -134,7 +140,8 @@ class SessionPersistence:
         if password_hash:
             data["password_hash"] = password_hash
 
-        with open(self.session_file, "w") as f:
+        session_file = self._get_session_file(email)
+        with open(session_file, "w") as f:
             json.dump(data, f, indent=2)
 
     def load_session(self, session: TecnoalarmSession, email: str) -> bool:
@@ -143,16 +150,17 @@ class SessionPersistence:
         
         Args:
             session: TecnoalarmSession instance to populate
-            email: User email to look up
+            email: User email to look up (used as filename identifier)
             
         Returns:
             True if session was loaded, False if not found or invalid
         """
-        if not self.session_file.exists():
+        session_file = self._get_session_file(email)
+        if not session_file.exists():
             return False
 
         try:
-            with open(self.session_file, "r") as f:
+            with open(session_file, "r") as f:
                 data = json.load(f)
 
             if data.get("email") != email:
@@ -205,18 +213,21 @@ class SessionPersistence:
         except (json.JSONDecodeError, OSError):
             return False
 
-    def clear_session(self) -> None:
-        """Delete saved session data."""
-        if self.session_file.exists():
-            self.session_file.unlink()
+    def clear_session(self, email: str) -> None:
+        """Delete saved session data for specific email."""
+        session_file = self._get_session_file(email)
+        if session_file.exists():
+            session_file.unlink()
 
     def get_saved_email(self) -> Optional[str]:
-        """Get email from last saved session."""
-        if not self.session_file.exists():
+        """Get email from last saved session (checks default session.json for backward compatibility)."""
+        # For backward compatibility, check old session.json file
+        old_session_file = self.storage_dir / "session.json"
+        if not old_session_file.exists():
             return None
 
         try:
-            with open(self.session_file, "r") as f:
+            with open(old_session_file, "r") as f:
                 data = json.load(f)
             return data.get("email")
         except (json.JSONDecodeError, OSError):
