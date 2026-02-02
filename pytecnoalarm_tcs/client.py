@@ -174,13 +174,13 @@ class TecnoalarmClient:
             raise TecnoalarmNotInitialized("Not authenticated")
         return await self.central.get_remotes()
 
-    async def arm_program(self, program_idx: int, mode: int, pin: str | None = None) -> bool:
+    async def arm_program(self, program_idx: int, mode: int = 3, pin: str | None = None) -> bool:
         """
         Arm a specific program with the specified mode.
         
         Args:
             program_idx: Program index (0-3)
-            mode: Arm mode - 1=day, 2=night, 3=away
+            mode: Arm mode - 1=day, 2=night, 3=armed (default: 3 for standard ON)
             pin: PIN for security validation (required)
             
         Returns:
@@ -188,6 +188,10 @@ class TecnoalarmClient:
             
         Raises:
             TecnoalarmPINRequired: If PIN is missing or incorrect
+            
+        Note:
+            Most systems use mode=3 (armed/ON) and mode=0 (disarmed/OFF).
+            Modes 1 (day) and 2 (night) are for advanced systems only.
         """
         if not self.session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")

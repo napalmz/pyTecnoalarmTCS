@@ -33,7 +33,15 @@ from .constants import (
 
 @dataclass
 class Program:
-    """Program (armed state) data"""
+    """
+    Program (armed state) data.
+    
+    Status values:
+    - 0 = disarmed (OFF)
+    - 1 = armed_day (optional, advanced systems)
+    - 2 = armed_night (optional, advanced systems)
+    - 3 = armed (ON - standard arm mode)
+    """
     index: int
     name: str | None
     status: int  # 0=disarmed, 1=day, 2=night, 3=away
@@ -44,11 +52,23 @@ class Program:
 
     @property
     def status_name(self) -> str:
+        """Get human-readable status name"""
         return PROGRAM_STATUS.get(self.status, "unknown")
 
     @property
     def display_name(self) -> str:
+        """Get program display name (custom name or default)"""
         return self.name or f"Program {self.index}"
+    
+    @property
+    def is_armed(self) -> bool:
+        """Check if program is armed (any armed mode)"""
+        return self.status != 0
+    
+    @property
+    def is_disarmed(self) -> bool:
+        """Check if program is disarmed"""
+        return self.status == 0
 
 
 @dataclass
