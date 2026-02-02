@@ -254,11 +254,13 @@ GET   /tcsRC/push?take=N              # Get notifications
 
 All TCS requests include:
 
-- `Authorization: Bearer {token}`
+- `Auth: {token}`
 - `X-App-Id: {app_id}`
+- `TCS-Token: {tcs_token}` (present on registered endpoints)
 - `atype: app`
 - `lang: it`
 - `ver: 1.0`
+- `Accept: application/json, text/plain, */*`
 
 ## Notes
 
