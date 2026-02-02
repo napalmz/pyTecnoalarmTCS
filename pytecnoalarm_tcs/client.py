@@ -270,3 +270,36 @@ class TecnoalarmClient:
         if not self.persistence:
             raise ValueError("Persistence not configured. Call set_persistence() first.")
         self.persistence.clear_session(email)
+
+    def get_sessions_directory(self) -> str:
+        """Get absolute path to directory containing session files.
+        
+        Useful for debugging or monitoring saved sessions from HA.
+        
+        Returns:
+            Absolute path to sessions directory
+            
+        Raises:
+            ValueError: If persistence is not configured
+        """
+        if not self.persistence:
+            raise ValueError("Persistence not configured. Call set_persistence() first.")
+        return self.persistence.get_sessions_dir()
+
+    def get_session_file_path(self, email: str) -> str:
+        """Get absolute path to session file for specific email.
+        
+        Useful for debugging or monitoring session file creation.
+        
+        Args:
+            email: Email address
+            
+        Returns:
+            Absolute path to the session file
+            
+        Raises:
+            ValueError: If persistence is not configured
+        """
+        if not self.persistence:
+            raise ValueError("Persistence not configured. Call set_persistence() first.")
+        return self.persistence.get_session_file(email)

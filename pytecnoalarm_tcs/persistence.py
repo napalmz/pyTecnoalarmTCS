@@ -58,8 +58,29 @@ class SessionPersistence:
                     self._fernet = Fernet(self._get_machine_key())
             # If crypto not available, silently fall back to plaintext
     
+    def get_sessions_dir(self) -> str:
+        """Get absolute path to sessions directory.
+        
+        Returns:
+            Absolute path to the directory containing session files
+        """
+        return str(self.sessions_dir.absolute())
+    
+    def get_session_file(self, email: str) -> str:
+        """Get absolute path to session file for specific email.
+        
+        Args:
+            email: Email address
+            
+        Returns:
+            Absolute path to the session file
+        """
+        sanitized = email.replace("@", "_").replace(".", "_")
+        session_file = self.sessions_dir / f"session_{sanitized}.json"
+        return str(session_file.absolute())
+    
     def _get_session_file(self, email: str) -> Path:
-        """Get session file path for a specific email."""
+        """Get session file path for a specific email (internal)."""
         # Sanitize email for filename (replace @ and . with _)
         sanitized = email.replace("@", "_").replace(".", "_")
         return self.sessions_dir / f"session_{sanitized}.json"
