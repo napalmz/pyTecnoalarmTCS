@@ -147,23 +147,6 @@ if persistence.load_session(client.session, email):
 persistence = SessionPersistence(storage_dir=".tecnoalarm", encryption_key="disabled")
 ```
 
-## Home Assistant Simulation (dev)
-
-Per simulare il polling HA con OTP, sessione persistente e retry:
-
-```bash
-python test_ha_simulation.py
-```
-
-Imposta credenziali in `.env` oppure inseriscile da prompt:
-
-```bash
-TCS_EMAIL=you@example.com
-TCS_PASS=yourpassword
-POLL_INTERVAL=10
-ZONE_POLL_INTERVAL=1
-```
-
 ## File Structure
 
 ```text
