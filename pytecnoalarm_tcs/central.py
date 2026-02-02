@@ -311,23 +311,33 @@ class TecnoalarmCentral:
         
         return programs
 
-    async def arm_program(self, program_idx: int, mode: int) -> bool:
+    async def arm_program(self, program_idx: int, mode: int, pin: str | None = None) -> bool:
         """
         Arm a specific program with the specified mode.
         
         Args:
             program_idx: Program index (0-3)
             mode: Arm mode - 1=day, 2=night, 3=away
+            pin: PIN for security validation (required)
         
         Returns:
             True if successful
         
         Raises:
             TecnoalarmNotInitialized: If not authenticated
+            TecnoalarmPINRequired: If PIN is missing or incorrect
             TecnoalarmAPIError: If API call fails
         """
         if not self._session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
+        
+        # Validate PIN
+        if not pin:
+            raise TecnoalarmPINRequired("PIN is required for arm operation")
+        
+        stored_pin = self._session.get_pin()
+        if not stored_pin or stored_pin != pin:
+            raise TecnoalarmPINRequired("Invalid PIN")
 
         if mode not in [1, 2, 3]:
             raise ValueError(f"Invalid arm mode: {mode}. Must be 1 (day), 2 (night), or 3 (away)")
@@ -351,22 +361,32 @@ class TecnoalarmCentral:
         except aiohttp.ClientError as e:
             raise TecnoalarmAPIError(f"Network error arming program {program_idx}: {e}")
 
-    async def disarm_program(self, program_idx: int) -> bool:
+    async def disarm_program(self, program_idx: int, pin: str | None = None) -> bool:
         """
         Disarm a specific program.
         
         Args:
             program_idx: Program index (0-3)
+            pin: PIN for security validation (required)
         
         Returns:
             True if successful
         
         Raises:
             TecnoalarmNotInitialized: If not authenticated
+            TecnoalarmPINRequired: If PIN is missing or incorrect
             TecnoalarmAPIError: If API call fails
         """
         if not self._session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
+        
+        # Validate PIN
+        if not pin:
+            raise TecnoalarmPINRequired("PIN is required for disarm operation")
+        
+        stored_pin = self._session.get_pin()
+        if not stored_pin or stored_pin != pin:
+            raise TecnoalarmPINRequired("Invalid PIN")
 
         try:
             # The endpoint pattern from HAR: PUT /tcsRC/program/{idx}/off

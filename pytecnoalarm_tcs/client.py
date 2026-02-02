@@ -174,34 +174,42 @@ class TecnoalarmClient:
             raise TecnoalarmNotInitialized("Not authenticated")
         return await self.central.get_remotes()
 
-    async def arm_program(self, program_idx: int, mode: int) -> bool:
+    async def arm_program(self, program_idx: int, mode: int, pin: str | None = None) -> bool:
         """
         Arm a specific program with the specified mode.
         
         Args:
             program_idx: Program index (0-3)
             mode: Arm mode - 1=day, 2=night, 3=away
+            pin: PIN for security validation (required)
             
         Returns:
             True if successful
+            
+        Raises:
+            TecnoalarmPINRequired: If PIN is missing or incorrect
         """
         if not self.session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
-        return await self.central.arm_program(program_idx, mode)
+        return await self.central.arm_program(program_idx, mode, pin)
 
-    async def disarm_program(self, program_idx: int) -> bool:
+    async def disarm_program(self, program_idx: int, pin: str | None = None) -> bool:
         """
         Disarm a specific program.
         
         Args:
             program_idx: Program index (0-3)
+            pin: PIN for security validation (required)
             
         Returns:
             True if successful
+            
+        Raises:
+            TecnoalarmPINRequired: If PIN is missing or incorrect
         """
         if not self.session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
-        return await self.central.disarm_program(program_idx)
+        return await self.central.disarm_program(program_idx, pin)
 
     async def get_logs(self, from_id: int = 0, limit: int = 100) -> list:
         """Get alarm system logs"""
