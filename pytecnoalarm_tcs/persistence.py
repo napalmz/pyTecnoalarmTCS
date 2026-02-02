@@ -45,6 +45,12 @@ class SessionPersistence:
         # Create sessions subdirectory for session files
         self.sessions_dir = self.storage_dir / "sessions"
         self.sessions_dir.mkdir(exist_ok=True)
+        
+        # Setup encryption
+        self._fernet = None
+        if encryption_key != "disabled":
+            if CRYPTO_AVAILABLE:
+                if encryption_key:
                     # Use provided key
                     self._fernet = Fernet(encryption_key.encode())
                 else:
