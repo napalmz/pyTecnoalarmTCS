@@ -42,13 +42,9 @@ class SessionPersistence:
     ):
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(exist_ok=True)
-        # Note: session_file is now dynamic based on email - see _get_session_file()
-        
-        # Setup encryption
-        self._fernet = None
-        if encryption_key != "disabled":
-            if CRYPTO_AVAILABLE:
-                if encryption_key:
+        # Create sessions subdirectory for session files
+        self.sessions_dir = self.storage_dir / "sessions"
+        self.sessions_dir.mkdir(exist_ok=True)
                     # Use provided key
                     self._fernet = Fernet(encryption_key.encode())
                 else:
@@ -60,7 +56,7 @@ class SessionPersistence:
         """Get session file path for a specific email."""
         # Sanitize email for filename (replace @ and . with _)
         sanitized = email.replace("@", "_").replace(".", "_")
-        return self.storage_dir / f"session_{sanitized}.json"
+        return self.sessions_dir / f"session_{sanitized}.json"
     
     def _get_machine_key(self) -> bytes:
         """Generate a machine-specific encryption key."""

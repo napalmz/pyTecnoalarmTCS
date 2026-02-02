@@ -50,6 +50,7 @@ class TecnoalarmClient:
         self.session = TecnoalarmSession(aiohttp_session)
         self.auth = TecnoalarmAuth(self.session)
         self.central = TecnoalarmCentral(self.session)
+        self.persistence = None  # Set via set_persistence()
 
     # ========== Auth Flow ==========
 
@@ -250,3 +251,22 @@ class TecnoalarmClient:
         if not self.session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
         return await self.central.delete_push_notification(notification_id)
+
+    # ========== Session Management ==========
+
+    def set_persistence(self, persistence) -> None:
+        """Set persistence handler for session management."""
+        self.persistence = persistence
+
+    def clear_saved_session(self, email: str) -> None:
+        """Delete saved session data for a specific email.
+        
+        Args:
+            email: Email address whose session file should be deleted
+            
+        Raises:
+            ValueError: If persistence is not configured
+        """
+        if not self.persistence:
+            raise ValueError("Persistence not configured. Call set_persistence() first.")
+        self.persistence.clear_session(email)
