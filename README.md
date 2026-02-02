@@ -1,15 +1,18 @@
-# Tecnoalarm TCS Python Client
+# pytecnoalarm-tcs
 
-Python library for controlling Tecnoalarm Evolution alarm systems via the TCS API.
+Async Python library for controlling Tecnoalarm Evolution alarm systems via the TCS API.
 
 ## Features
 
 - ✅ **Authentication Flow**: Handshake → Email Validation → Login with OTP → App Registration
+- ✅ **Auto PIN discovery**: `register_app()` can fetch PIN from `/tps`
 - ✅ **Central Operations**: Programs, Zones, Remotes status
-- ⚠️ **Alarm Control (planned)**: Arm/Disarm stubs present, endpoint not yet implemented
+- ✅ **Alarm Control (experimental)**: Arm/Disarm via `/program/{idx}/on|off`
 - ✅ **Logging**: View alarm logs and clear memory
 - ✅ **Push Notifications**: Get notification count and details
-- ✅ **Session Persistence**: Save/load sessions to avoid repeated OTP
+- ✅ **Session Persistence**: Save/load sessions to avoid repeated OTP (optional encryption)
+- ✅ **Session Reliability**: Automatic activation + retry on transient empty program list
+- ✅ **Token Expiration Handling**: 401 → `TecnoalarmReauthRequired`
 - ✅ **Error Handling**: Comprehensive exception types
 
 ## Installation
@@ -18,12 +21,14 @@ Python library for controlling Tecnoalarm Evolution alarm systems via the TCS AP
 pip install -e .
 ```
 
+> Nota: `cryptography` è usato per cifrare sessioni e PIN su disco.
+
 ## Quick Start
 
 ```python
 import asyncio
 import aiohttp
-from pyTecnoalarm_TCS import TecnoalarmClient, TecnoalarmOTPRequired
+from pytecnoalarm_tcs import TecnoalarmClient, TecnoalarmOTPRequired
 
 async def main():
     async with aiohttp.ClientSession() as session:
@@ -42,8 +47,8 @@ async def main():
             otp = input("Enter OTP from email: ")
             await client.login("user@example.com", "password", otp)
         
-        # Step 4: Register app with central PIN
-        await client.register_app("123456")
+        # Step 4: Register app (PIN is auto-discovered if not provided)
+        await client.register_app()
         
         # Step 5: Get central status
         programs = await client.get_programs()
@@ -75,8 +80,9 @@ except TecnoalarmOTPRequired:
 # Login with OTP (second call)
 await client.login("email@example.com", "password", otp="123456")
 
-# Register app with central PIN
-await client.register_app("1234")
+# Register app with central PIN (optional)
+await client.register_app()       # Auto-discover PIN
+await client.register_app("1234")  # Explicit PIN override
 
 # Logout
 await client.logout()
@@ -103,12 +109,11 @@ remotes = await client.get_remotes()
 status = await client.get_central_status()
 ```
 
-### Alarm Control (planned)
+### Alarm Control (experimental)
 
-The methods `arm_program` / `disarm_program` currently raise `NotImplementedError`
-because the Tecnoalarm REST endpoints for arm/disarm have not yet been extracted
-from HAR traffic. The PIN validation helper is in place; once the endpoint is
-known the methods will be wired to the real API.
+Arm/disarm uses `/program/{idx}/on` and `/program/{idx}/off` endpoints extracted
+from HAR traffic. If the server rejects the call, you may need to re-register the app
+or verify the PIN.
 
 ### Logs and Notifications
 
@@ -126,7 +131,7 @@ notifications = await client.get_push_notifications(take=10)
 ### Session Persistence
 
 ```python
-from pyTecnoalarm_TCS.persistence import SessionPersistence
+from pytecnoalarm_tcs.persistence import SessionPersistence
 
 persistence = SessionPersistence(storage_dir=".tecnoalarm")
 
@@ -137,12 +142,32 @@ persistence.save_session(client.session, email)
 # Load session on next run (avoids OTP)
 if persistence.load_session(client.session, email):
     print("Session restored!")
+
+# Optional: disable encryption
+persistence = SessionPersistence(storage_dir=".tecnoalarm", encryption_key="disabled")
+```
+
+## Home Assistant Simulation (dev)
+
+Per simulare il polling HA con OTP, sessione persistente e retry:
+
+```bash
+python test_ha_simulation.py
+```
+
+Imposta credenziali in `.env` oppure inseriscile da prompt:
+
+```bash
+TCS_EMAIL=you@example.com
+TCS_PASS=yourpassword
+POLL_INTERVAL=10
+ZONE_POLL_INTERVAL=1
 ```
 
 ## File Structure
 
 ```text
-pyTecnoalarm_TCS/
+pytecnoalarm_tcs/
 ├── __init__.py           # Main exports
 ├── client.py             # Main public API
 ├── session.py            # Session state management
@@ -186,13 +211,15 @@ class Zone:
 ## Exception Handling
 
 ```python
-from pyTecnoalarm_TCS import (
+from pytecnoalarm_tcs import (
     TecnoalarmError,           # Base exception
     TecnoalarmOTPRequired,     # OTP needed
     TecnoalarmPINRequired,     # PIN validation failed
     TecnoalarmAuthError,       # Wrong credentials
     TecnoalarmEmailNotFound,   # Email not registered
+    TecnoalarmReauthRequired,  # Token expired or invalid
     TecnoalarmAPIError,        # Generic API error
+    TecnoalarmInvalidEmail,    # Invalid email format
     TecnoalarmNetworkError,    # Network issues
 )
 ```
@@ -202,12 +229,14 @@ from pyTecnoalarm_TCS import (
 The library handles PIN in multiple ways:
 
 1. **Registration**: PIN is required after login to register the app
-2. **Validation**: PIN is stored securely after registration
-3. **Sensitive Operations**: Arm/disarm operations require PIN verification
-4. **Storage**: PIN can be persisted to disk (should be encrypted in production)
+2. **Auto-discovery**: If PIN not provided, it is fetched from `/tps`
+3. **Validation**: PIN is stored after registration
+4. **Sensitive Operations**: Arm/disarm operations require PIN verification
+5. **Storage**: PIN can be persisted to disk (encrypted if `cryptography` is available)
 
 ```python
-# Set PIN during registration
+# Set PIN during registration (optional)
+await client.register_app()
 await client.register_app("1234")
 
 # PIN is automatically validated for sensitive operations
@@ -224,6 +253,7 @@ POST  /account/login?otp=XXX          # Login with OTP (200 = success)
 
 GET   /tcsRC/tps                      # List centrals
 GET   /tcsRC/monitor/{tp_type}.{id}   # Monitor central status
+GET   /tcsRC/tpstatus/sse?quick=true  # SSE sync (programs/zones)
 PUT   /tcsRC/tp                       # Register app (with PIN)
 DELETE /tcsRC/tp                      # Unregister app
 
@@ -254,6 +284,8 @@ All TCS requests include:
 - PIN is required for sensitive operations and must match registered PIN
 - Responses are often base64-encoded JSON
 - Some endpoints require initial handshake for service discovery
+- Programs can briefly return empty when server session is stale; automatic retry is in place
+- Tokens expire after ~24h; re-authenticate if `TecnoalarmReauthRequired` is raised
 
 ## License
 
@@ -261,4 +293,4 @@ MIT
 
 ## Support
 
-For issues or questions, please check the HAR file analysis and example.py for reference implementations.
+Per problemi o domande, apri una issue su GitHub e allega i log con `DEBUG`.

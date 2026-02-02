@@ -43,6 +43,7 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+test*
 
 # HAR files (may contain sensitive data)
 *.har
