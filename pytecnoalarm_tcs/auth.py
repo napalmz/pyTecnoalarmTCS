@@ -27,6 +27,10 @@ class TecnoalarmAuth:
     def __init__(self, session):
         self._session = session
         self._central_data = None  # Will store central data for PIN registration
+        
+        # Monitor polling state (keepalive)
+        self._polling_active = False
+        self._polling_task = None
 
     # ---------- handshake ----------
 
@@ -309,10 +313,20 @@ class TecnoalarmAuth:
             if isinstance(central_data, dict):
                 _store_program_names(central_data.get("programs"))
         
-        # Add PIN to central data for registration
+        # Step 1: First POST /tp with minimal data (valid_data=false)
+        # This registers the central with just the PIN, no programs/zones yet
         payload = central_data.copy() if isinstance(central_data, dict) else {}
         payload["code"] = pin
+        # Remove programs/zones/remotes from first POST - they're empty anyway
+        payload["programs"] = []
+        payload["zones"] = []
+        payload["remotes"] = []
+        payload["codes"] = []
+        payload["keys"] = []
+        payload["rcmds"] = []
+        payload["valid_data"] = False
         
+        print("[INFO] Registering central (Step 1): POST /tp with PIN and empty data...")
         async with self._session._session.post(
             self._session.tcs_url("/tp"),
             json=payload,
@@ -323,7 +337,9 @@ class TecnoalarmAuth:
 
             if resp.status != 200:
                 error_text = await resp.text()
-                raise TecnoalarmAPIError(f"App registration with PIN failed: {resp.status} - {error_text[:200]}")
+                raise TecnoalarmAPIError(f"First app registration POST /tp failed: {resp.status} - {error_text[:200]}")
+        
+        print("[INFO] First registration successful")
 
         # Store PIN securely (will be used for future operations requiring PIN validation)
         self._session.set_pin(pin)
@@ -340,98 +356,105 @@ class TecnoalarmAuth:
                 self._session.central_type = type_str
                 self._session.central_id = central_sn
                 
-                # CRITICAL: Call /tpstatus/sse?quick=true to sync data from central
-                # This is a Server-Sent Events (SSE) endpoint that progressively downloads
-                # programs, zones, and other data from the physical central unit.
-                # Without this call, GET /program will return empty []
-                print("[INFO] Syncing central data via /tpstatus/sse...")
-                sse_headers = self._session.tcs_headers()
-                sse_headers["Accept"] = "text/event-stream"
+                # Step 2: Get SSE data to populate programs/zones/remotes
+                # The /tpstatus/sse endpoint returns Server-Sent Events with the data
+                # The HAR shows it requires ONLY Cookie auth, with Accept: text/event-stream header
+                print("[INFO] Step 2: Fetching programs/zones/remotes via /tpstatus/sse...")
                 
                 sse_data = None
                 try:
+                    sse_headers = {
+                        "Accept": "text/event-stream",
+                        # NO Auth/TCS-Token headers for SSE - only Cookie
+                    }
+                    
                     async with self._session._session.get(
                         self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true"),
                         headers=sse_headers,
-                        timeout=aiohttp.ClientTimeout(total=10),
+                        timeout=aiohttp.ClientTimeout(total=30),
                     ) as resp:
                         print(f"[DEBUG] /tpstatus/sse response status: {resp.status}")
                         if resp.status == 200:
-                            # Read the SSE stream until completion
-                            # The stream contains multiple "data:" events with progress updates
-                            full_data = await resp.text()
-                            print(f"[INFO] Sync completed ({len(full_data)} bytes received)")
+                            # Read the SSE stream
+                            # Format: data:{json}\n\ndata:{json}\n\n...
+                            full_response = await resp.text()
                             
-                            # Parse SSE events to extract final data
-                            # The last event (progress=200) contains the complete data
+                            # Try to decode if base64
                             try:
-                                decoded = base64.b64decode(full_data).decode('utf-8')
+                                decoded = base64.b64decode(full_response).decode('utf-8')
                             except:
-                                decoded = full_data
+                                decoded = full_response
                             
-                            # Split by "data:" to get individual events
-                            events = decoded.split('\ndata:')
+                            print(f"[DEBUG] SSE response length: {len(decoded)} bytes")
                             
-                            # Find the last event with actual data (highest progress)
-                            for event in reversed(events):
-                                event = event.strip().replace('data:', '', 1).strip()
-                                if event:
-                                    try:
-                                        event_data = json.loads(event)
-                                        # Check if this event has programs/zones data
-                                        if event_data.get('programs') or event_data.get('zones'):
-                                            sse_data = event_data
-                                            programs_count = len(event_data.get('programs', []))
-                                            zones_count = len(event_data.get('zones', []))
-                                            print(f"[INFO] Extracted SSE data: {programs_count} programs, {zones_count} zones")
-                                            break
-                                    except:
-                                        continue
-                        elif resp.status == 406:
-                            print(f"[WARN] /tpstatus/sse returned 406 (Not Acceptable) - trying without Accept header...")
-                            # Try again without the Accept header
-                            sse_headers2 = self._session.tcs_headers()
-                            async with self._session._session.get(
-                                self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true"),
-                                headers=sse_headers2,
-                                timeout=aiohttp.ClientTimeout(total=10),
-                            ) as resp2:
-                                if resp2.status == 200:
-                                    full_data = await resp2.text()
-                                    print(f"[INFO] Sync completed without Accept header ({len(full_data)} bytes)")
+                            # Parse SSE events - look for "data:{...}" lines
+                            # Take the last complete event which should have all data
+                            lines = decoded.split('\n')
+                            last_data = None
+                            
+                            for line in reversed(lines):
+                                line = line.strip()
+                                if line.startswith('data:'):
+                                    # Remove "data:" prefix and parse JSON
+                                    json_str = line[5:].strip()
+                                    if json_str:
+                                        try:
+                                            event_data = json.loads(json_str)
+                                            # Found complete data with programs/zones
+                                            if (event_data.get('programs') and len(event_data.get('programs', [])) > 0) or \
+                                               (event_data.get('zones') and len(event_data.get('zones', [])) > 0):
+                                                last_data = event_data
+                                                break
+                                        except json.JSONDecodeError:
+                                            continue
+                            
+                            if last_data:
+                                sse_data = last_data
+                                programs_count = len(sse_data.get('programs', []))
+                                zones_count = len(sse_data.get('zones', []))
+                                remotes_count = len(sse_data.get('remotes', []))
+                                print(f"[INFO] SSE data extracted: {programs_count} programs, {zones_count} zones, {remotes_count} remotes")
+                            else:
+                                print(f"[WARN] SSE response received but no programs/zones found")
                         else:
-                            print(f"[WARN] /tpstatus/sse returned {resp.status} - continuing anyway")
-                except TimeoutError:
-                    print(f"[WARN] /tpstatus/sse timeout - continuing anyway")
+                            print(f"[WARN] /tpstatus/sse returned {resp.status}")
+                
+                except asyncio.TimeoutError:
+                    print(f"[WARN] /tpstatus/sse timeout after 30s - continuing with empty data")
                 except Exception as e:
-                    print(f"[WARN] /tpstatus/sse error: {e} - continuing anyway")
+                    print(f"[WARN] /tpstatus/sse error: {e} - continuing with empty data")
                 
-                # After SSE sync, do 6 monitor calls
+                # Step 3: Do monitor polling calls (the app does these between SSE and second POST /tp)
                 monitor_path = f"/monitor/{type_str}.{central_sn}"
-                for _ in range(6):
-                    async with self._session._session.get(
-                        self._session.tcs_url(monitor_path),
-                        headers=self._session.tcs_headers(),
-                    ) as resp:
-                        pass
+                print(f"[DEBUG] Doing monitor polling calls to {monitor_path}...")
+                for i in range(1, 7):
+                    try:
+                        async with self._session._session.get(
+                            self._session.tcs_url(monitor_path),
+                            headers=self._session.tcs_headers(),
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as resp:
+                            pass  # Discard response
+                    except:
+                        pass  # Ignore errors
                 
-                # CRITICAL: Second POST /tp after SSE sync with complete data!
-                # The HAR shows this is necessary to "commit" the synced data
-                # The payload MUST include the programs/zones extracted from SSE
-                print("[INFO] Finalizing central registration with second POST /tp...")
+                # Step 4: Second POST /tp with complete data (valid_data=true)
+                # This "commits" the sync with all the programs/zones/remotes data
+                print("[INFO] Step 4: Finalizing registration - POST /tp with complete data...")
                 
-                # Update payload with SSE data if available
+                # Prepare final payload with SSE data
                 if sse_data:
-                    # Merge SSE data into payload
+                    # Update programs/zones/remotes from SSE data
                     payload['programs'] = sse_data.get('programs', [])
                     payload['zones'] = sse_data.get('zones', [])
                     payload['remotes'] = sse_data.get('remotes', [])
                     payload['codes'] = sse_data.get('codes', [])
                     payload['keys'] = sse_data.get('keys', [])
                     payload['rcmds'] = sse_data.get('rcmds', [])
-                    # Mark as valid data
-                    if sse_data.get('programs') or sse_data.get('zones'):
-                        payload['valid_data'] = True
+                    # Mark as valid/synced
+                    payload['valid_data'] = True
+                    payload['syncCRC'] = sse_data.get('syncCRC')
+                    # Store program names for future reference
                     _store_program_names(sse_data.get('programs'))
                 
                 async with self._session._session.post(
@@ -441,54 +464,29 @@ class TecnoalarmAuth:
                 ) as resp:
                     if resp.status != 200:
                         print(f"[WARN] Second POST /tp returned {resp.status} - continuing anyway")
+                    else:
+                        print(f"[INFO] Second POST /tp successful")
                 
-                # CRITICAL: After second POST /tp, immediately do 3 monitor calls
-                # The browser does 3 consecutive monitor calls after second POST /tp
-                for _ in range(3):
-                    async with self._session._session.get(
-                        self._session.tcs_url(monitor_path),
-                        headers=self._session.tcs_headers(),
-                    ) as resp:
-                        pass  # Discard response, just need the calls
+                # Step 5: Final monitor polling calls after second POST
+                print(f"[DEBUG] Doing final monitor polling calls...")
+                for i in range(1, 4):
+                    try:
+                        async with self._session._session.get(
+                            self._session.tcs_url(monitor_path),
+                            headers=self._session.tcs_headers(),
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as resp:
+                            pass  # Discard response
+                    except:
+                        pass  # Ignore errors
                 
-                # If TCS-Token is still not set, get it via PUT /app
-                if not self._session.tcs_token:
-                    print("[INFO] Getting TCS-Token via PUT /app...")
-                    temp_headers = self._session.auth_headers()
-                    temp_headers.update({
-                        "TCS-Token": "disabled",
-                        "so": "IOS-26.2",
-                        "atype": "app",
-                        "lang": "it",
-                        "ver": "1.0",
-                    })
-                    
-                    async with self._session._session.put(
-                        self._session.tcs_url("/app"),
-                        json=[],
-                        headers=temp_headers,
-                    ) as resp:
-                        if resp.status == 200:
-                            response_text = await resp.text()
-                            try:
-                                app_data = json.loads(response_text)
-                            except json.JSONDecodeError:
-                                try:
-                                    decoded = base64.b64decode(response_text).decode("utf-8")
-                                    app_data = json.loads(decoded)
-                                except:
-                                    app_data = None
-                            
-                            if isinstance(app_data, dict):
-                                tcs_token = app_data.get("token")
-                                if tcs_token:
-                                    expiration = app_data.get("expiration")
-                                    self._session.set_tcs_token(tcs_token, expiration)
-                                    print(f"[INFO] TCS-Token obtained (expires: {self._session.get_token_expiration_str()})")
-                
-                # Give server time to process the sync data
-                import asyncio
-                await asyncio.sleep(1)
+                # Step 6: Start background monitor polling (keepalive)
+                # This runs continuously throughout the session lifetime
+                print("[INFO] Starting background monitor polling...")
+                self._polling_active = True
+                self._polling_task = asyncio.create_task(
+                    self._start_monitor_polling(type_str, central_sn)
+                )
 
     # ---------- logout ----------
 
@@ -558,10 +556,81 @@ class TecnoalarmAuth:
         except aiohttp.ClientError as e:
             raise TecnoalarmAPIError(f"Network error during token refresh: {e}")
 
+    # ---------- background monitor polling (keepalive) ----------
+
+    async def _start_monitor_polling(self, central_type: str, central_id: str) -> None:
+        """
+        Background task for continuous monitor polling (keepalive).
+        This runs continuously while session is active.
+        
+        Args:
+            central_type: Type prefix (e.g., "tp042")
+            central_id: Central serial number (e.g., "003236056")
+        """
+        monitor_path = f"/monitor/{central_type}.{central_id}"
+        poll_interval = 2.5  # seconds between polls (HAR shows ~2-3 second intervals)
+        
+        print(f"[DEBUG] Monitor polling started for {central_type}.{central_id} (interval: {poll_interval}s)")
+        
+        while self._polling_active:
+            try:
+                async with self._session._session.get(
+                    self._session.tcs_url(monitor_path),
+                    headers=self._session.tcs_headers(),
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    # Response status is not critical - this is just a keepalive
+                    # Server might return 200, 304 (not modified), or other status codes
+                    if resp.status not in (200, 304, 204):
+                        print(f"[DEBUG] Monitor polling got status {resp.status} - continuing")
+            except asyncio.TimeoutError:
+                # Timeout is not fatal - just continue polling
+                print(f"[DEBUG] Monitor polling timeout - retrying")
+            except asyncio.CancelledError:
+                # Task was cancelled - normal shutdown
+                break
+            except Exception as e:
+                # Any other error - log but continue
+                print(f"[DEBUG] Monitor polling error: {e} - retrying")
+            
+            # Wait before next polling
+            try:
+                await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                break
+        
+        print(f"[DEBUG] Monitor polling stopped")
+
+    async def _stop_monitor_polling(self) -> None:
+        """
+        Stop the background monitor polling task.
+        """
+        if self._polling_active:
+            self._polling_active = False
+            
+            if self._polling_task:
+                try:
+                    # Give the task a moment to stop gracefully
+                    await asyncio.wait_for(self._polling_task, timeout=2)
+                except asyncio.TimeoutError:
+                    # Force cancel if it doesn't stop
+                    self._polling_task.cancel()
+                    try:
+                        await self._polling_task
+                    except asyncio.CancelledError:
+                        pass
+                except Exception:
+                    pass
+                
+                self._polling_task = None
+
     async def logout(self) -> None:
         """
         Logout and unregister the app.
         """
+        # Stop background polling first
+        await self._stop_monitor_polling()
+        
         try:
             async with self._session._session.delete(
                 self._session.tcs_url(TCS_TP_REGISTER),
