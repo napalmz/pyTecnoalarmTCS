@@ -1,5 +1,6 @@
 import base64
 import json
+import asyncio
 import aiohttp
 from .exceptions import (
     TecnoalarmOTPRequired,
@@ -288,6 +289,10 @@ class TecnoalarmAuth:
                 # Capture program names from central data if present
                 if isinstance(central_data, dict):
                     _store_program_names(central_data.get("programs"))
+                    # Store central name for device naming in integrations
+                    central_name = central_data.get("description") or central_data.get("name")
+                    if central_name:
+                        self._session.central_name = str(central_name).strip()
             
             # Extract PIN from central data
             if not central_data:
@@ -344,43 +349,62 @@ class TecnoalarmAuth:
                 sse_headers["Accept"] = "text/event-stream"
                 
                 sse_data = None
-                async with self._session._session.get(
-                    self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true"),
-                    headers=sse_headers,
-                ) as resp:
-                    if resp.status == 200:
-                        # Read the SSE stream until completion
-                        # The stream contains multiple "data:" events with progress updates
-                        full_data = await resp.text()
-                        print(f"[INFO] Sync completed ({len(full_data)} bytes received)")
-                        
-                        # Parse SSE events to extract final data
-                        # The last event (progress=200) contains the complete data
-                        try:
-                            decoded = base64.b64decode(full_data).decode('utf-8')
-                        except:
-                            decoded = full_data
-                        
-                        # Split by "data:" to get individual events
-                        events = decoded.split('\ndata:')
-                        
-                        # Find the last event with actual data (highest progress)
-                        for event in reversed(events):
-                            event = event.strip().replace('data:', '', 1).strip()
-                            if event:
-                                try:
-                                    event_data = json.loads(event)
-                                    # Check if this event has programs/zones data
-                                    if event_data.get('programs') or event_data.get('zones'):
-                                        sse_data = event_data
-                                        programs_count = len(event_data.get('programs', []))
-                                        zones_count = len(event_data.get('zones', []))
-                                        print(f"[INFO] Extracted SSE data: {programs_count} programs, {zones_count} zones")
-                                        break
-                                except:
-                                    continue
-                    else:
-                        print(f"[WARN] /tpstatus/sse returned {resp.status} - continuing anyway")
+                try:
+                    async with self._session._session.get(
+                        self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true"),
+                        headers=sse_headers,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        print(f"[DEBUG] /tpstatus/sse response status: {resp.status}")
+                        if resp.status == 200:
+                            # Read the SSE stream until completion
+                            # The stream contains multiple "data:" events with progress updates
+                            full_data = await resp.text()
+                            print(f"[INFO] Sync completed ({len(full_data)} bytes received)")
+                            
+                            # Parse SSE events to extract final data
+                            # The last event (progress=200) contains the complete data
+                            try:
+                                decoded = base64.b64decode(full_data).decode('utf-8')
+                            except:
+                                decoded = full_data
+                            
+                            # Split by "data:" to get individual events
+                            events = decoded.split('\ndata:')
+                            
+                            # Find the last event with actual data (highest progress)
+                            for event in reversed(events):
+                                event = event.strip().replace('data:', '', 1).strip()
+                                if event:
+                                    try:
+                                        event_data = json.loads(event)
+                                        # Check if this event has programs/zones data
+                                        if event_data.get('programs') or event_data.get('zones'):
+                                            sse_data = event_data
+                                            programs_count = len(event_data.get('programs', []))
+                                            zones_count = len(event_data.get('zones', []))
+                                            print(f"[INFO] Extracted SSE data: {programs_count} programs, {zones_count} zones")
+                                            break
+                                    except:
+                                        continue
+                        elif resp.status == 406:
+                            print(f"[WARN] /tpstatus/sse returned 406 (Not Acceptable) - trying without Accept header...")
+                            # Try again without the Accept header
+                            sse_headers2 = self._session.tcs_headers()
+                            async with self._session._session.get(
+                                self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true"),
+                                headers=sse_headers2,
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            ) as resp2:
+                                if resp2.status == 200:
+                                    full_data = await resp2.text()
+                                    print(f"[INFO] Sync completed without Accept header ({len(full_data)} bytes)")
+                        else:
+                            print(f"[WARN] /tpstatus/sse returned {resp.status} - continuing anyway")
+                except TimeoutError:
+                    print(f"[WARN] /tpstatus/sse timeout - continuing anyway")
+                except Exception as e:
+                    print(f"[WARN] /tpstatus/sse error: {e} - continuing anyway")
                 
                 # After SSE sync, do 6 monitor calls
                 monitor_path = f"/monitor/{type_str}.{central_sn}"
