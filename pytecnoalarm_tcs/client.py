@@ -303,3 +303,24 @@ class TecnoalarmClient:
         if not self.persistence:
             raise ValueError("Persistence not configured. Call set_persistence() first.")
         return self.persistence.get_session_file(email)
+
+    def get_central_name(self) -> str:
+        """Get the central name from session.
+        
+        Returns the name of the central unit configured in the alarm system.
+        This value is populated after successful authentication and registration.
+        
+        Returns:
+            str: The name of the central alarm unit (e.g., "ALLARME CASA"),
+                or empty string if not available.
+        """
+        if hasattr(self.session, 'central_name') and self.session.central_name:
+            return self.session.central_name
+        
+        # Fallback: try to get from program_names (first non-"PROGRAMMA TOTALE" name)
+        if hasattr(self.session, 'program_names') and self.session.program_names:
+            for name in self.session.program_names.values():
+                if isinstance(name, str) and name.strip() and name.strip().upper() != "PROGRAMMA TOTALE":
+                    return name.strip()
+        
+        return ""

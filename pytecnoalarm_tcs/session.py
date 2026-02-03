@@ -23,6 +23,7 @@ class TecnoalarmSession:
         # Central data
         self.central_type: str | None = None  # e.g., "tp042"
         self.central_id: str | None = None    # e.g., "003236056"
+        self.central_name: str | None = None  # e.g., "ALLARME CASA"
         self._central_activated: bool = False  # Track if monitor was called
         self.program_names: dict[int, str] = {}  # index -> name/description
         
