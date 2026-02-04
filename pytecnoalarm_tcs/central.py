@@ -118,6 +118,25 @@ class TecnoalarmCentral:
         self._session_activation_lock = asyncio.Lock()
         self._last_zone_activation = 0.0  # Time of last zone session activation
         self._zone_activation_interval = 1.0  # Minimum seconds between zone activations (increased from 2s)
+        
+        # Streaming connections for /program, /zone, /remote, /monitor endpoints
+        self._program_stream_task: asyncio.Task | None = None
+        self._zone_stream_task: asyncio.Task | None = None
+        self._remote_stream_task: asyncio.Task | None = None
+        self._monitor_stream_task: asyncio.Task | None = None
+        
+        # Cached data from streaming endpoints
+        self._cached_programs: list[Program] = []
+        self._cached_zones: list[Zone] = []
+        self._cached_remotes: list[dict] = []
+        self._cached_monitor: dict[str, Any] = {}
+        
+        # Lock for cache access
+        self._cache_lock = asyncio.Lock()
+        
+        # Streaming configuration
+        self._stream_reconnect_interval = 540  # 9 minutes (540 seconds) for program/zone/remote
+        self._monitor_reconnect_interval = 30  # 30 seconds for monitor
 
     # ---------- Central Info ----------
 
@@ -228,99 +247,432 @@ class TecnoalarmCentral:
                 # Network errors on monitor are non-fatal, continue
                 pass
     
-    async def get_programs(self) -> list[Program]:
+    async def _maintain_program_stream(self) -> None:
         """
-        Get list of programs (armed states).
-        Implements automatic retry if the server returns an empty list,
-        which can happen if the central session is in a transient invalid state.
+        Maintain a persistent streaming connection to GET /tcs/program.
+        
+        The /tcs/program endpoint uses chunked transfer encoding and keeps
+        the connection open, sending periodic updates. This method:
+        - Opens a long-lived connection
+        - Reads chunks as they arrive
+        - Updates the cached programs list
+        - Reconnects every 9 minutes (540 seconds)
         """
-        if not self._session.is_authenticated:
-            raise TecnoalarmNotInitialized("Not authenticated")
-
-        async def _fetch_programs_once() -> list[Program]:
-            """Internal method to fetch programs once."""
+        import sys
+        
+        while True:
+            print("[DEBUG] Starting program stream connection...", file=sys.stderr)
+            
             try:
-                # Activate central session FIRST (single monitor call)
+                # Activate session first
                 await self._activate_central_session()
                 
-                # Proceed directly to GET /program
-                # (Removed extra monitor call to reduce server load)
+                # Open streaming connection with long timeout
                 async with self._session._session.get(
                     self._session.tcs_url(TCS_PROGRAM),
                     headers=self._session.tcs_headers(),
+                    timeout=aiohttp.ClientTimeout(total=self._stream_reconnect_interval + 60),
                 ) as resp:
                     if resp.status != 200:
-                        raise TecnoalarmAPIError(f"Get programs failed: {resp.status}")
-
-                    response_data = await resp.text()
+                        print(f"[ERROR] Program stream failed: {resp.status}", file=sys.stderr)
+                        await asyncio.sleep(10)  # Wait before retry
+                        continue
                     
-                    # Handle empty response
-                    if not response_data:
-                        import sys
-                        print("[WARN] GET /program returned empty response", file=sys.stderr)
-                        return []
+                    print(f"[DEBUG] Program stream connected (status {resp.status})", file=sys.stderr)
                     
-                    try:
-                        # Try parsing as JSON first
-                        data = json.loads(response_data)
-                    except json.JSONDecodeError:
-                        # Response is base64 encoded JSON array
+                    # Read chunks with timeout for reconnection
+                    stream_start = asyncio.get_event_loop().time()
+                    
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if not chunk:
+                            continue
+                        
+                        # Decode and parse the chunk
                         try:
-                            decoded = base64.b64decode(response_data).decode("utf-8")
-                            data = json.loads(decoded)
-                        except Exception as decode_err:
-                            import sys
-                            print(f"[ERROR] Failed to decode programs response: {decode_err}", file=sys.stderr)
-                            print(f"[ERROR] Raw response ({len(response_data)} bytes): {response_data[:200]}", file=sys.stderr)
-                            return []
-
-                    programs = []
-                    if isinstance(data, list):
-                        for idx, prog in enumerate(data):
-                            if isinstance(prog, dict):
-                                program_name = None
-                                if hasattr(self._session, "program_names"):
-                                    program_name = self._session.program_names.get(idx)
-                                programs.append(
-                                    Program(
-                                        index=idx,
-                                        name=program_name,
-                                        status=prog.get("status", 0),
-                                        prealarm=prog.get("prealarm", False),
-                                        alarm=prog.get("alarm", False),
-                                        memory_alarm=prog.get("memAlarm", False),
-                                        free=prog.get("free", False),
+                            chunk_text = chunk.decode('utf-8').strip()
+                            
+                            # Try parsing as JSON first (might not be base64)
+                            try:
+                                data = json.loads(chunk_text)
+                            except json.JSONDecodeError:
+                                # Try base64 decoding
+                                decoded = base64.b64decode(chunk_text).decode('utf-8')
+                                data = json.loads(decoded)
+                            
+                            if isinstance(data, list):
+                                # Update cached programs
+                                programs = []
+                                for idx, prog in enumerate(data):
+                                    if isinstance(prog, dict):
+                                        program_name = None
+                                        if hasattr(self._session, "program_names"):
+                                            program_name = self._session.program_names.get(idx)
+                                        programs.append(
+                                            Program(
+                                                index=idx,
+                                                name=program_name,
+                                                status=prog.get("status", 0),
+                                                prealarm=prog.get("prealarm", False),
+                                                alarm=prog.get("alarm", False),
+                                                memory_alarm=prog.get("memAlarm", False),
+                                                free=prog.get("free", False),
+                                            )
+                                        )
+                                
+                                async with self._cache_lock:
+                                    self._cached_programs = programs
+                                    print(f"[DEBUG] Updated programs cache: {len(programs)} programs", file=sys.stderr)
+                        
+                        except Exception as e:
+                            print(f"[WARN] Failed to parse program chunk: {e}", file=sys.stderr)
+                        
+                        # Check if we should reconnect
+                        elapsed = asyncio.get_event_loop().time() - stream_start
+                        if elapsed >= self._stream_reconnect_interval:
+                            print(f"[DEBUG] Program stream reconnecting after {elapsed:.1f}s", file=sys.stderr)
+                            break
+            
+            except asyncio.CancelledError:
+                print("[DEBUG] Program stream cancelled", file=sys.stderr)
+                break
+            except Exception as e:
+                print(f"[ERROR] Program stream error: {type(e).__name__}: {e}", file=sys.stderr)
+                await asyncio.sleep(10)  # Wait before retry
+    
+    async def _maintain_zone_stream(self) -> None:
+        """Maintain persistent streaming connection to GET /tcs/zone."""
+        import sys
+        
+        while True:
+            print("[INFO] Starting zone stream connection...", file=sys.stderr)
+            
+            try:
+                await self._activate_central_session()
+                
+                async with self._session._session.get(
+                    self._session.tcs_url(TCS_ZONE),
+                    headers=self._session.tcs_headers(),
+                    timeout=aiohttp.ClientTimeout(total=self._stream_reconnect_interval + 60),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[ERROR] Zone stream failed: {resp.status}", file=sys.stderr)
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    print(f"[INFO] Zone stream active (reconnecting every {self._stream_reconnect_interval}s)", file=sys.stderr)
+                    
+                    stream_start = asyncio.get_event_loop().time()
+                    chunk_count = 0
+                    buffer = ""  # Accumulate partial chunks
+                    
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if not chunk:
+                            continue
+                        
+                        try:
+                            # Decode chunk and add to buffer
+                            chunk_text = chunk.decode('utf-8', errors='ignore').strip()
+                            buffer += chunk_text
+                            
+                            # Try to parse the complete buffer
+                            data = None
+                            try:
+                                # Try direct JSON parse first
+                                data = json.loads(buffer)
+                                buffer = ""  # Clear buffer on success
+                            except json.JSONDecodeError:
+                                # Try base64 decoding
+                                try:
+                                    decoded = base64.b64decode(buffer).decode('utf-8')
+                                    data = json.loads(decoded)
+                                    buffer = ""  # Clear buffer on success
+                                except Exception:
+                                    # If buffer gets too large, reset it
+                                    if len(buffer) > 10000:
+                                        print(f"[WARN] Zone buffer too large ({len(buffer)} chars), resetting", file=sys.stderr)
+                                        buffer = ""
+                                    continue  # Wait for more data
+                            
+                            if data and isinstance(data, list):
+                                zones = []
+                                for idx, zone in enumerate(data):
+                                    zones.append(
+                                        Zone(
+                                            index=zone.get("idx", idx),
+                                            description=zone.get("description", ""),
+                                            icon=zone.get("icon", ""),
+                                            status=zone.get("status", "UNKNOWN"),
+                                            camera=zone.get("camera", ""),
+                                            allocated=zone.get("allocated", False),
+                                            in_supervision=zone.get("inSupervision", False),
+                                            in_low_battery=zone.get("inLowBattery", False),
+                                            in_fail=zone.get("inFail", False),
+                                            in_paired_device_supervision=zone.get("inPairedDeviceSupervision", False),
+                                        )
                                     )
-                                )
-                    else:
-                        import sys
-                        print(f"[ERROR] GET /program response is not a list, got {type(data).__name__}: {str(data)[:200]}", file=sys.stderr)
-
-                    return programs
-            except aiohttp.ClientError as e:
-                raise TecnoalarmAPIError(f"Network error getting programs: {e}")
-        
-        # First attempt with normal rate limiting
-        programs = await _fetch_programs_once()
-        
-        # If empty, retry with forced session reset
-        if not programs:
-            import sys
-            print("[RETRY] Programs list is empty, retrying with forced reactivation...", file=sys.stderr)
+                                
+                                async with self._cache_lock:
+                                    self._cached_zones = zones
+                                
+                                chunk_count += 1
+                                if chunk_count == 1:
+                                    print(f"[INFO] Received initial zone data: {len(zones)} zones", file=sys.stderr)
+                        
+                        except Exception as e:
+                            print(f"[WARN] Failed to parse zone chunk: {e}", file=sys.stderr)
+                        
+                        elapsed = asyncio.get_event_loop().time() - stream_start
+                        if elapsed >= self._stream_reconnect_interval:
+                            print(f"[INFO] Zone stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            break
             
-            # Reset rate limiter to force full activation on next zone poll
-            self._last_zone_activation = 0.0
+            except asyncio.CancelledError:
+                print("[INFO] Zone stream stopped", file=sys.stderr)
+                break
+            except Exception as e:
+                print(f"[ERROR] Zone stream error: {type(e).__name__}: {e}", file=sys.stderr)
+                await asyncio.sleep(10)
+    
+    async def _maintain_remote_stream(self) -> None:
+        """Maintain persistent streaming connection to GET /tcs/remote."""
+        import sys
+        
+        while True:
+            print("[INFO] Starting remote stream connection...", file=sys.stderr)
             
-            # Wait a tiny bit before retry
+            try:
+                await self._activate_central_session()
+                
+                async with self._session._session.get(
+                    self._session.tcs_url(TCS_REMOTE),
+                    headers=self._session.tcs_headers(),
+                    timeout=aiohttp.ClientTimeout(total=self._stream_reconnect_interval + 60),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[ERROR] Remote stream failed: {resp.status}", file=sys.stderr)
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    print(f"[INFO] Remote stream active (reconnecting every {self._stream_reconnect_interval}s)", file=sys.stderr)
+                    
+                    stream_start = asyncio.get_event_loop().time()
+                    chunk_count = 0
+                    
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if not chunk:
+                            continue
+                        
+                        try:
+                            chunk_text = chunk.decode('utf-8').strip()
+                            
+                            try:
+                                data = json.loads(chunk_text)
+                            except json.JSONDecodeError:
+                                decoded = base64.b64decode(chunk_text).decode('utf-8')
+                                data = json.loads(decoded)
+                            
+                            if isinstance(data, list):
+                                async with self._cache_lock:
+                                    self._cached_remotes = data
+                                
+                                chunk_count += 1
+                                if chunk_count == 1:
+                                    print(f"[INFO] Received initial remote data: {len(data)} remotes", file=sys.stderr)
+                        
+                        except Exception as e:
+                            print(f"[WARN] Failed to parse remote chunk: {e}", file=sys.stderr)
+                        
+                        elapsed = asyncio.get_event_loop().time() - stream_start
+                        if elapsed >= self._stream_reconnect_interval:
+                            print(f"[INFO] Remote stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            break
+            
+            except asyncio.CancelledError:
+                print("[INFO] Remote stream stopped", file=sys.stderr)
+                break
+            except Exception as e:
+                print(f"[ERROR] Remote stream error: {type(e).__name__}: {e}", file=sys.stderr)
+                await asyncio.sleep(10)
+    
+    async def _maintain_monitor_stream(self) -> None:
+        """Maintain persistent streaming connection to GET /tcs/monitor with 30s reconnects."""
+        import sys
+        
+        if not self._session.central_type or not self._session.central_id:
+            print("[WARN] Cannot start monitor stream: central not configured", file=sys.stderr)
+            return
+        
+        monitor_path = f"/monitor/{self._session.central_type}.{self._session.central_id}"
+        
+        while True:
+            print("[INFO] Starting monitor stream connection...", file=sys.stderr)
+            
+            try:
+                async with self._session._session.get(
+                    self._session.tcs_url(monitor_path),
+                    headers=self._session.tcs_headers(),
+                    timeout=aiohttp.ClientTimeout(total=self._monitor_reconnect_interval + 10),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[ERROR] Monitor stream failed: {resp.status}", file=sys.stderr)
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    print(f"[INFO] Monitor stream active (reconnecting every {self._monitor_reconnect_interval}s)", file=sys.stderr)
+                    
+                    stream_start = asyncio.get_event_loop().time()
+                    chunk_count = 0
+                    
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if not chunk:
+                            continue
+                        
+                        try:
+                            chunk_text = chunk.decode('utf-8').strip()
+                            
+                            try:
+                                data = json.loads(chunk_text)
+                            except json.JSONDecodeError:
+                                decoded = base64.b64decode(chunk_text).decode('utf-8')
+                                data = json.loads(decoded)
+                            
+                            if isinstance(data, dict):
+                                async with self._cache_lock:
+                                    self._cached_monitor = data
+                                
+                                chunk_count += 1
+                                if chunk_count == 1:
+                                    print(f"[INFO] Received initial monitor data", file=sys.stderr)
+                        
+                        except Exception as e:
+                            print(f"[WARN] Failed to parse monitor chunk: {e}", file=sys.stderr)
+                        
+                        elapsed = asyncio.get_event_loop().time() - stream_start
+                        if elapsed >= self._monitor_reconnect_interval:
+                            print(f"[INFO] Monitor stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            break
+            
+            except asyncio.CancelledError:
+                print("[INFO] Monitor stream stopped", file=sys.stderr)
+                break
+            except Exception as e:
+                print(f"[ERROR] Monitor stream error: {type(e).__name__}: {e}", file=sys.stderr)
+                await asyncio.sleep(10)
+    
+    async def wait_for_streaming_ready(self, timeout: float = 10.0) -> bool:
+        """
+        Wait for streaming connections to receive initial data.
+        
+        Args:
+            timeout: Maximum seconds to wait (default: 10)
+            
+        Returns:
+            True if all streams have data, False if timeout
+        """
+        import sys
+        start_time = asyncio.get_event_loop().time()
+        
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            async with self._cache_lock:
+                has_programs = len(self._cached_programs) > 0
+                has_zones = len(self._cached_zones) > 0
+                has_remotes = len(self._cached_remotes) > 0
+                
+                if has_programs and has_zones:
+                    print(f"[INFO] Streaming ready: {len(self._cached_programs)} programs, {len(self._cached_zones)} zones, {len(self._cached_remotes)} remotes", file=sys.stderr)
+                    return True
+            
             await asyncio.sleep(0.2)
-            
-            # Retry once
-            programs = await _fetch_programs_once()
-            
-            if not programs:
-                print("[WARN] Programs still empty after retry", file=sys.stderr)
         
-        return programs
+        print(f"[WARN] Streaming timeout after {timeout}s", file=sys.stderr)
+        return False
+    
+    async def start_streaming(self) -> None:
+        """
+        Start background streaming tasks for programs, zones, remotes, and monitor.
+        This should be called after successful central registration.
+        """
+        import sys
+        
+        if not self._session.is_central_ready:
+            print("[WARN] Cannot start streaming: central not ready", file=sys.stderr)
+            return
+        
+        # Start program stream
+        if self._program_stream_task is None or self._program_stream_task.done():
+            self._program_stream_task = asyncio.create_task(self._maintain_program_stream())
+            print("[INFO] Program streaming started (auto-reconnect every 9 min)", file=sys.stderr)
+        
+        # Start zone stream
+        if self._zone_stream_task is None or self._zone_stream_task.done():
+            self._zone_stream_task = asyncio.create_task(self._maintain_zone_stream())
+            print("[INFO] Zone streaming started (auto-reconnect every 9 min)", file=sys.stderr)
+        
+        # Start remote stream
+        if self._remote_stream_task is None or self._remote_stream_task.done():
+            self._remote_stream_task = asyncio.create_task(self._maintain_remote_stream())
+            print("[INFO] Remote streaming started (auto-reconnect every 9 min)", file=sys.stderr)
+        
+        # Start monitor stream
+        if self._monitor_stream_task is None or self._monitor_stream_task.done():
+            self._monitor_stream_task = asyncio.create_task(self._maintain_monitor_stream())
+            print("[INFO] Monitor streaming started (auto-reconnect every 30 sec)", file=sys.stderr)
+    
+    async def stop_streaming(self) -> None:
+        """
+        Stop all background streaming tasks.
+        This should be called during logout.
+        """
+        import sys
+        
+        # Stop all streaming tasks
+        tasks = [
+            (self._program_stream_task, "Program"),
+            (self._zone_stream_task, "Zone"),
+            (self._remote_stream_task, "Remote"),
+            (self._monitor_stream_task, "Monitor"),
+        ]
+        
+        for task, name in tasks:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                print(f"[INFO] {name} streaming stopped", file=sys.stderr)
+    
+    async def get_programs(self) -> list[Program]:
+        """
+        Get list of programs (armed states).
+        
+        This method returns cached data from the persistent streaming connection.
+        If streaming is not active, it will start it and wait for initial data.
+        """
+        if not self._session.is_authenticated:
+            raise TecnoalarmNotInitialized("Not authenticated")
+        
+        # Start streaming if not already running (check ALL tasks, not just program)
+        all_tasks_running = (
+            (self._program_stream_task and not self._program_stream_task.done()) and
+            (self._zone_stream_task and not self._zone_stream_task.done()) and
+            (self._remote_stream_task and not self._remote_stream_task.done()) and
+            (self._monitor_stream_task and not self._monitor_stream_task.done())
+        )
+        
+        if not all_tasks_running:
+            await self.start_streaming()
+            
+            # Wait for initial data (up to 10 seconds)
+            for i in range(100):  # 100 * 0.1s = 10 seconds max
+                await asyncio.sleep(0.1)
+                async with self._cache_lock:
+                    if self._cached_programs:
+                        break
+        
+        # Return cached data
+        async with self._cache_lock:
+            return self._cached_programs.copy()
 
     async def arm_program(self, program_idx: int, mode: int, pin: str | None = None) -> bool:
         """
@@ -420,11 +772,34 @@ class TecnoalarmCentral:
     async def get_zones(self) -> list[Zone]:
         """
         Get list of zones with their current status.
-        Zones are polled frequently (every 1 second) but we rate limit
-        the session activation to every 1 second to keep server load reasonable.
+        
+        This method returns cached data from the persistent streaming connection.
+        If streaming is not active, it will start it and wait for initial data.
         """
         if not self._session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
+        
+        # Start streaming if not already running (check all tasks)
+        all_tasks_running = (
+            (self._program_stream_task and not self._program_stream_task.done()) and
+            (self._zone_stream_task and not self._zone_stream_task.done()) and
+            (self._remote_stream_task and not self._remote_stream_task.done()) and
+            (self._monitor_stream_task and not self._monitor_stream_task.done())
+        )
+        
+        if not all_tasks_running:
+            await self.start_streaming()
+            
+            # Wait for initial data (up to 10 seconds)
+            for i in range(100):  # 100 * 0.1s = 10 seconds max
+                await asyncio.sleep(0.1)
+                async with self._cache_lock:
+                    if self._cached_zones:
+                        break
+        
+        # Return cached data
+        async with self._cache_lock:
+            return self._cached_zones.copy()
 
         try:
             # Rate limit zone activation to avoid overwhelming server
@@ -498,10 +873,34 @@ class TecnoalarmCentral:
     async def get_remotes(self) -> list:
         """
         Get list of remotes (wireless key fobs) and their battery status.
-        Each boolean indicates if remote is OK (True) or has issues (False).
+        
+        This method returns cached data from the persistent streaming connection.
+        If streaming is not active, it will start it and wait for initial data.
         """
         if not self._session.is_authenticated:
             raise TecnoalarmNotInitialized("Not authenticated")
+        
+        # Start streaming if not already running (check all tasks)
+        all_tasks_running = (
+            (self._program_stream_task and not self._program_stream_task.done()) and
+            (self._zone_stream_task and not self._zone_stream_task.done()) and
+            (self._remote_stream_task and not self._remote_stream_task.done()) and
+            (self._monitor_stream_task and not self._monitor_stream_task.done())
+        )
+        
+        if not all_tasks_running:
+            await self.start_streaming()
+            
+            # Wait for initial data (up to 10 seconds)
+            for i in range(100):  # 100 * 0.1s = 10 seconds max
+                await asyncio.sleep(0.1)
+                async with self._cache_lock:
+                    if self._cached_remotes:
+                        break
+        
+        # Return cached data
+        async with self._cache_lock:
+            return self._cached_remotes.copy()
 
         try:
             # Activate central session FIRST

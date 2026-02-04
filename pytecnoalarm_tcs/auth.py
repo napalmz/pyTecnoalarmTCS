@@ -850,9 +850,14 @@ class TecnoalarmAuth:
             ) as resp:
                 if resp.status not in (200, 204):
                     raise TecnoalarmAPIError(f"Logout failed: {resp.status}")
+        except Exception:
+            # Continue with cleanup even if logout request fails
+            pass
         finally:
             # Clear all session data regardless of response
             self._session.token = None
             self._session.app_id = None
             self._session.account_id = None
             self._session._pin = None
+            self._session.central_type = None
+            self._session.central_id = None

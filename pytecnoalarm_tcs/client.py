@@ -115,11 +115,21 @@ class TecnoalarmClient:
         if not self.session.is_authenticated:
             raise TecnoalarmNotInitialized("Call login() first")
         await self.auth.register_app(pin)
+        
+        # Start streaming connections after successful registration
+        if self.session.is_central_ready:
+            await self.central.start_streaming()
+            # Wait for streams to receive initial data
+            await self.central.wait_for_streaming_ready(timeout=10.0)
 
     async def logout(self) -> None:
         """
         Logout and unregister app from central.
         """
+        # Stop streaming connections first
+        await self.central.stop_streaming()
+        
+        # Then proceed with logout
         await self.auth.logout()
 
     async def refresh_token(self) -> None:
