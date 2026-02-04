@@ -214,20 +214,19 @@ class TecnoalarmCentral:
             
             monitor_path = f"/monitor/{self._session.central_type}.{self._session.central_id}"
             
-            # Always call monitor 3 times (even if previously activated)
-            # This ensures server-side session state is kept fresh
-            for i in range(3):
-                try:
-                    async with self._session._session.get(
-                        self._session.tcs_url(monitor_path),
-                        headers=self._session.tcs_headers(),
-                    ) as resp:
-                        if resp.status != 200:
-                            # Log warning but continue - monitor failures are non-fatal
-                            pass
-                except Exception as e:
-                    # Network errors on monitor are non-fatal, continue
-                    pass
+            # Call monitor once to refresh server-side session state
+            # (Reduced from 3 calls to avoid 503 errors from excessive requests)
+            try:
+                async with self._session._session.get(
+                    self._session.tcs_url(monitor_path),
+                    headers=self._session.tcs_headers(),
+                ) as resp:
+                    if resp.status != 200:
+                        # Log warning but continue - monitor failures are non-fatal
+                        pass
+            except Exception as e:
+                # Network errors on monitor are non-fatal, continue
+                pass
     
     async def get_programs(self) -> list[Program]:
         """
@@ -241,19 +240,11 @@ class TecnoalarmCentral:
         async def _fetch_programs_once() -> list[Program]:
             """Internal method to fetch programs once."""
             try:
-                # Activate central session FIRST
+                # Activate central session FIRST (single monitor call)
                 await self._activate_central_session()
                 
-                # CRITICAL: Call monitor ONE MORE TIME immediately before GET /program
-                # (The browser does this right before each GET endpoint)
-                if self._session.central_type and self._session.central_id:
-                    monitor_path = f"/monitor/{self._session.central_type}.{self._session.central_id}"
-                    async with self._session._session.get(
-                        self._session.tcs_url(monitor_path),
-                        headers=self._session.tcs_headers(),
-                    ) as resp:
-                        pass  # Discard response, just need the call
-                
+                # Proceed directly to GET /program
+                # (Removed extra monitor call to reduce server load)
                 async with self._session._session.get(
                     self._session.tcs_url(TCS_PROGRAM),
                     headers=self._session.tcs_headers(),

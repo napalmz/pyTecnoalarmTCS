@@ -768,7 +768,7 @@ class TecnoalarmAuth:
             central_id: Central serial number (e.g., "003236056")
         """
         monitor_path = f"/monitor/{central_type}.{central_id}"
-        poll_interval = 2.5  # seconds between polls (HAR shows ~2-3 second intervals)
+        poll_interval = 5.0  # seconds between polls (increased to reduce server load)
         
         print(f"[DEBUG] Monitor polling started for {central_type}.{central_id} (interval: {poll_interval}s)")
         
