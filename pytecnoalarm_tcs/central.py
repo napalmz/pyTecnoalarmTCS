@@ -331,6 +331,13 @@ class TecnoalarmCentral:
                         if elapsed >= self._stream_reconnect_interval:
                             print(f"[DEBUG] Program stream reconnecting after {elapsed:.1f}s", file=sys.stderr)
                             break
+                    
+                    # If stream ended early, wait before reconnecting
+                    elapsed = asyncio.get_event_loop().time() - stream_start
+                    if elapsed < self._stream_reconnect_interval:
+                        remaining = self._stream_reconnect_interval - elapsed
+                        print(f"[DEBUG] Program stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
+                        await asyncio.sleep(remaining)
             
             except asyncio.CancelledError:
                 print("[DEBUG] Program stream cancelled", file=sys.stderr)
@@ -344,7 +351,7 @@ class TecnoalarmCentral:
         import sys
         
         while True:
-            print("[INFO] Starting zone stream connection...", file=sys.stderr)
+            print("[DEBUG] Starting zone stream connection...", file=sys.stderr)
             
             try:
                 await self._activate_central_session()
@@ -359,7 +366,7 @@ class TecnoalarmCentral:
                         await asyncio.sleep(10)
                         continue
                     
-                    print(f"[INFO] Zone stream active (reconnecting every {self._stream_reconnect_interval}s)", file=sys.stderr)
+                    print(f"[DEBUG] Zone stream active (reconnecting every {self._stream_reconnect_interval}s)", file=sys.stderr)
                     
                     stream_start = asyncio.get_event_loop().time()
                     chunk_count = 0
@@ -416,15 +423,22 @@ class TecnoalarmCentral:
                                 
                                 chunk_count += 1
                                 if chunk_count == 1:
-                                    print(f"[INFO] Received initial zone data: {len(zones)} zones", file=sys.stderr)
+                                    print(f"[DEBUG] Received initial zone data: {len(zones)} zones", file=sys.stderr)
                         
                         except Exception as e:
                             print(f"[WARN] Failed to parse zone chunk: {e}", file=sys.stderr)
                         
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._stream_reconnect_interval:
-                            print(f"[INFO] Zone stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            print(f"[DEBUG] Zone stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
                             break
+                    
+                    # If stream ended early, wait before reconnecting
+                    elapsed = asyncio.get_event_loop().time() - stream_start
+                    if elapsed < self._stream_reconnect_interval:
+                        remaining = self._stream_reconnect_interval - elapsed
+                        print(f"[DEBUG] Zone stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
+                        await asyncio.sleep(remaining)
             
             except asyncio.CancelledError:
                 print("[INFO] Zone stream stopped", file=sys.stderr)
@@ -438,7 +452,7 @@ class TecnoalarmCentral:
         import sys
         
         while True:
-            print("[INFO] Starting remote stream connection...", file=sys.stderr)
+            print("[DEBUG] Starting remote stream connection...", file=sys.stderr)
             
             try:
                 await self._activate_central_session()
@@ -453,7 +467,7 @@ class TecnoalarmCentral:
                         await asyncio.sleep(10)
                         continue
                     
-                    print(f"[INFO] Remote stream active (reconnecting every {self._stream_reconnect_interval}s)", file=sys.stderr)
+                    print(f"[DEBUG] Remote stream active (reconnecting every {self._stream_reconnect_interval}s)", file=sys.stderr)
                     
                     stream_start = asyncio.get_event_loop().time()
                     chunk_count = 0
@@ -477,15 +491,22 @@ class TecnoalarmCentral:
                                 
                                 chunk_count += 1
                                 if chunk_count == 1:
-                                    print(f"[INFO] Received initial remote data: {len(data)} remotes", file=sys.stderr)
+                                    print(f"[DEBUG] Received initial remote data: {len(data)} remotes", file=sys.stderr)
                         
                         except Exception as e:
                             print(f"[WARN] Failed to parse remote chunk: {e}", file=sys.stderr)
                         
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._stream_reconnect_interval:
-                            print(f"[INFO] Remote stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            print(f"[DEBUG] Remote stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
                             break
+                    
+                    # If stream ended early, wait before reconnecting
+                    elapsed = asyncio.get_event_loop().time() - stream_start
+                    if elapsed < self._stream_reconnect_interval:
+                        remaining = self._stream_reconnect_interval - elapsed
+                        print(f"[DEBUG] Remote stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
+                        await asyncio.sleep(remaining)
             
             except asyncio.CancelledError:
                 print("[INFO] Remote stream stopped", file=sys.stderr)
@@ -495,30 +516,36 @@ class TecnoalarmCentral:
                 await asyncio.sleep(10)
     
     async def _maintain_monitor_stream(self) -> None:
-        """Maintain persistent streaming connection to GET /tcs/monitor with 540s reconnects."""
+        """
+        Maintain persistent streaming connection to GET /tcs/monitor.
+        This is an SSE stream like /program, /zone, /remote.
+        """
         import sys
         
         if not self._session.central_type or not self._session.central_id:
             print("[WARN] Cannot start monitor stream: central not configured", file=sys.stderr)
             return
         
-        monitor_path = f"/monitor/{self._session.central_type}.{self._session.central_id}"
+        monitor_path = TCS_MONITOR.format(
+            tp_type=self._session.central_type,
+            central_id=self._session.central_id
+        )
         
         while True:
-            print("[INFO] Starting monitor stream connection...", file=sys.stderr)
+            print("[DEBUG] Starting monitor stream connection...", file=sys.stderr)
             
             try:
                 async with self._session._session.get(
                     self._session.tcs_url(monitor_path),
                     headers=self._session.tcs_headers(),
-                    timeout=aiohttp.ClientTimeout(total=self._monitor_reconnect_interval + 10),
+                    timeout=aiohttp.ClientTimeout(total=self._monitor_reconnect_interval + 60),
                 ) as resp:
                     if resp.status != 200:
                         print(f"[ERROR] Monitor stream failed: {resp.status}", file=sys.stderr)
                         await asyncio.sleep(10)
                         continue
                     
-                    print(f"[INFO] Monitor stream active (reconnecting every {self._monitor_reconnect_interval}s)", file=sys.stderr)
+                    print(f"[DEBUG] Monitor stream active (reconnecting every {self._monitor_reconnect_interval}s)", file=sys.stderr)
                     
                     stream_start = asyncio.get_event_loop().time()
                     chunk_count = 0
@@ -542,15 +569,22 @@ class TecnoalarmCentral:
                                 
                                 chunk_count += 1
                                 if chunk_count == 1:
-                                    print(f"[INFO] Received initial monitor data", file=sys.stderr)
+                                    print(f"[DEBUG] Received initial monitor data", file=sys.stderr)
                         
                         except Exception as e:
                             print(f"[WARN] Failed to parse monitor chunk: {e}", file=sys.stderr)
                         
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._monitor_reconnect_interval:
-                            print(f"[INFO] Monitor stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            print(f"[DEBUG] Monitor stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
                             break
+                    
+                    # If stream ended early, wait before reconnecting
+                    elapsed = asyncio.get_event_loop().time() - stream_start
+                    if elapsed < self._monitor_reconnect_interval:
+                        remaining = self._monitor_reconnect_interval - elapsed
+                        print(f"[DEBUG] Monitor stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
+                        await asyncio.sleep(remaining)
             
             except asyncio.CancelledError:
                 print("[INFO] Monitor stream stopped", file=sys.stderr)
