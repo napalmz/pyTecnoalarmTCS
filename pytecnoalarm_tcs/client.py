@@ -131,6 +131,24 @@ class TecnoalarmClient:
             raise TecnoalarmNotInitialized("Not authenticated")
         await self.auth.refresh_tcs_token()
 
+    async def get_account_short(self) -> str | None:
+        """Get /account/short (base64 response from account service)."""
+        if not self.session.is_authenticated:
+            raise TecnoalarmNotInitialized("Not authenticated")
+        return await self.auth.get_account_short()
+
+    async def get_push_preference(self) -> str | None:
+        """Get /tcs/app/pushPreference (base64 true/false)."""
+        if not self.session.is_authenticated:
+            raise TecnoalarmNotInitialized("Not authenticated")
+        return await self.auth.get_push_preference()
+
+    async def get_push_count(self) -> str | None:
+        """Get /tcs/push/count (base64 numeric string)."""
+        if not self.session.is_authenticated:
+            raise TecnoalarmNotInitialized("Not authenticated")
+        return await self.auth.get_push_count()
+
     # ========== Central Operations ==========
 
     async def get_central_status(self) -> dict:

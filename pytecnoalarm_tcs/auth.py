@@ -28,9 +28,13 @@ class TecnoalarmAuth:
         self._session = session
         self._central_data = None  # Will store central data for PIN registration
         
-        # Monitor polling state (keepalive)
+        # Monitor streaming state (persistent connection)
+        self._monitor_stream_task: asyncio.Task | None = None
+        self._monitor_response: aiohttp.ClientResponse | None = None
+        
+        # Legacy polling state (kept for compatibility)
         self._polling_active = False
-        self._polling_task = None
+        self._polling_task: asyncio.Task | None = None
 
     # ---------- handshake ----------
 
@@ -233,6 +237,62 @@ class TecnoalarmAuth:
                 expiration = app_data.get("expiration")
                 self._session.set_tcs_token(tcs_token, expiration)
 
+        # Optional post-login warmup calls (non-blocking if they fail)
+        try:
+            await self._post_login_warmup()
+        except Exception:
+            pass
+
+    # ---------- post-login warmup ----------
+
+    def _tcs_headers_allow_empty_token(self) -> dict:
+        headers = self._session.auth_headers()
+        # IMPROVEMENT (from HAR): Official app sends "disabled" instead of empty string
+        headers["TCS-Token"] = self._session.tcs_token or "disabled"
+        headers.update({
+            "atype": "app",
+            "lang": "it",
+            "ver": "1.0",
+            "Accept": "application/json, text/plain, */*",
+        })
+        return headers
+
+    async def get_account_short(self) -> str | None:
+        """Fetch /account/short (returns base64 string, often '[]')."""
+        url = self._session.account_url("/short")
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Auth": self._session.token or "",
+        }
+        async with self._session._session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.text()
+
+    async def get_push_preference(self) -> str | None:
+        """Fetch /tcs/app/pushPreference (base64 'true/false')."""
+        url = self._session.tcs_url("/app/pushPreference")
+        headers = self._tcs_headers_allow_empty_token()
+        async with self._session._session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.text()
+
+    async def get_push_count(self) -> str | None:
+        """Fetch /tcs/push/count (base64 numeric string)."""
+        url = self._session.tcs_url("/push/count")
+        headers = self._tcs_headers_allow_empty_token()
+        async with self._session._session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.text()
+
+    async def _post_login_warmup(self) -> None:
+        """Optional warmup calls seen in the official app after login."""
+        await self.get_account_short()
+        await self.get_push_preference()
+        await self.get_push_count()
+
     # ---------- app registration ----------
 
     async def register_app(self, pin: str | None = None) -> None:
@@ -256,77 +316,129 @@ class TecnoalarmAuth:
             if mapping:
                 self._session.program_names.update(mapping)
 
-        # If PIN not provided, fetch from server via GET /tcsRC/tps
-        if not pin:
-            # Fetch central data from server (contains the PIN in "code" field)
-            async with self._session._session.get(
-                self._session.tcs_url("/tps"),
-                headers=self._session.tcs_headers(),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    # 401 means the token is expired or invalid - needs re-authentication
-                    if resp.status == 401:
-                        raise TecnoalarmReauthRequired(f"Token expired or invalid: {error_text[:200]}")
-                    raise TecnoalarmAPIError(f"Failed to fetch central data: {resp.status} - {error_text[:200]}")
-                
-                response_text = await resp.text()
-                try:
-                    data = json.loads(response_text)
-                except json.JSONDecodeError:
-                    decoded = base64.b64decode(response_text).decode("utf-8")
-                    data = json.loads(decoded)
-                
-                # data is likely a list of centrals
-                if isinstance(data, list) and len(data) > 0:
-                    central_data = data[0]
-                elif isinstance(data, dict):
-                    # Might be wrapped in another object
-                    if "tp" in data:
-                        central_data = data["tp"]
-                    elif "central" in data:
-                        central_data = data["central"]
-                    else:
-                        central_data = data
+        # CRITICAL: Always fetch central data from GET /tcs/tps
+        # This is needed to get description, icon, sn, type, passphTCS, etc.
+        # for the first POST /tp request
+        print("[INFO] Fetching central data from GET /tcs/tps...")
+        async with self._session._session.get(
+            self._session.tcs_url("/tps"),
+            headers=self._session.tcs_headers(),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                # 401 means the token is expired or invalid - needs re-authentication
+                if resp.status == 401:
+                    raise TecnoalarmReauthRequired(f"Token expired or invalid: {error_text[:200]}")
+                raise TecnoalarmAPIError(f"Failed to fetch central data: {resp.status} - {error_text[:200]}")
+            
+            response_text = await resp.text()
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                decoded = base64.b64decode(response_text).decode("utf-8")
+                data = json.loads(decoded)
+            
+            # data is likely a list of centrals
+            if isinstance(data, list) and len(data) > 0:
+                central_data = data[0]
+            elif isinstance(data, dict):
+                # Might be wrapped in another object
+                if "tp" in data:
+                    central_data = data["tp"]
+                elif "central" in data:
+                    central_data = data["central"]
                 else:
-                    central_data = None
-                # Capture program names from central data if present
-                if isinstance(central_data, dict):
-                    _store_program_names(central_data.get("programs"))
-                    # Store central name for device naming in integrations
-                    central_name = central_data.get("description") or central_data.get("name")
-                    if central_name:
-                        self._session.central_name = str(central_name).strip()
+                    central_data = data
+            else:
+                central_data = None
             
-            # Extract PIN from central data
-            if not central_data:
-                raise TecnoalarmAPIError("Central data not available from GET /tps")
-            
-            pin = central_data.get("code") if isinstance(central_data, dict) else None
-            if not pin:
-                raise TecnoalarmAPIError("No PIN found in central data from GET /tps")
+            # Capture program names from central data if present
+            if isinstance(central_data, dict):
+                _store_program_names(central_data.get("programs"))
+                # Store central name for device naming in integrations
+                central_name = central_data.get("description") or central_data.get("name")
+                if central_name:
+                    self._session.central_name = str(central_name).strip()
             
             # Store for later use
             self._central_data = central_data
+        
+        # Validate central data
+        if not central_data:
+            raise TecnoalarmAPIError("Central data not available from GET /tps")
+        
+        # If PIN not provided, extract it from central data
+        if not pin:
+            pin = central_data.get("code") if isinstance(central_data, dict) else None
+            if not pin:
+                raise TecnoalarmAPIError("No PIN found in central data from GET /tps")
+        
+        # Step 0.5: GET /monitor to obtain the syncCRC value
+        # CRITICAL: The official app calls GET /monitor BEFORE the first POST /tp
+        # to obtain the CRC value needed for syncCRC field
+        central_type = central_data.get("type")
+        central_sn = central_data.get("sn")
+        
+        # Build monitor URL based on type and serial number
+        # Example: type=38 → tp042, sn=003236056 → /monitor/tp042.003236056
+        type_map: dict[int, str] = {
+            38: "tp042",  # TP042 panel
+            # Add other types if needed
+        }
+        # Default to formatted type number if not in map or if type is None
+        if central_type is not None and central_type in type_map:
+            type_str = type_map[central_type]
+        elif central_type is not None:
+            type_str = f"tp{central_type:03d}"
         else:
-            central_data = self._central_data if self._central_data else {}
-            if isinstance(central_data, dict):
-                _store_program_names(central_data.get("programs"))
+            type_str = "tp000"  # Fallback if type is None
+        monitor_url = f"/monitor/{type_str}.{central_sn}"
+        
+        print(f"[INFO] Fetching CRC from GET {monitor_url}...")
+        sync_crc = None
+        try:
+            async with self._session._session.get(
+                self._session.tcs_url(monitor_url),
+                headers=self._session.tcs_headers(),
+            ) as resp:
+                if resp.status == 200:
+                    body_bytes = await resp.read()
+                    decoded = body_bytes.decode("utf-8")
+                    monitor_data = json.loads(decoded)
+                    sync_crc = monitor_data.get("crc")
+                    print(f"[DEBUG] Retrieved CRC from monitor: {sync_crc}")
+                else:
+                    print(f"[WARN] GET {monitor_url} returned {resp.status}, CRC will be null")
+        except Exception as e:
+            print(f"[WARN] Failed to fetch monitor CRC: {e}, CRC will be null")
         
         # Step 1: First POST /tp with minimal data (valid_data=false)
         # This registers the central with just the PIN, no programs/zones yet
+        # CRITICAL: Use actual data from GET /tcs/tps (description, icon, sn, type, etc.)
+        # NOT empty values!
         payload = central_data.copy() if isinstance(central_data, dict) else {}
+        
+        # Ensure required fields from GET /tcs/tps are present
+        # (description, icon, idx, sn, type, passphTCS, port)
+        # The response from /tcs/tps already has these, but ensure code is set
         payload["code"] = pin
-        # Remove programs/zones/remotes from first POST - they're empty anyway
+        
+        # Clear data arrays for first POST (will be populated after SSE)
         payload["programs"] = []
         payload["zones"] = []
         payload["remotes"] = []
         payload["codes"] = []
         payload["keys"] = []
         payload["rcmds"] = []
+        
+        # Mark as initial registration (not yet synced)
         payload["valid_data"] = False
+        payload["syncCRC"] = sync_crc  # Use CRC from GET /monitor
+        payload["use_fingerprint"] = True
         
         print("[INFO] Registering central (Step 1): POST /tp with PIN and empty data...")
+        print(f"[DEBUG] Payload: description={payload.get('description')}, sn={payload.get('sn')}, type={payload.get('type')}")
+        
         async with self._session._session.post(
             self._session.tcs_url("/tp"),
             json=payload,
@@ -356,87 +468,138 @@ class TecnoalarmAuth:
                 self._session.central_type = type_str
                 self._session.central_id = central_sn
                 
-                # Step 2: Get SSE data to populate programs/zones/remotes
+                # IMPORTANT: Both /monitor and /tpstatus/sse are STREAMING endpoints
+                # They keep connections open indefinitely and send continuous data
+                # They are NOT traditional request/response endpoints!
+                
+                # Step 2: Open the long-lived monitor stream
+                # This connection will stay open throughout the entire session
+                monitor_path = f"/monitor/{type_str}.{central_sn}"
+                print(f"[DEBUG] Step 2: Opening persistent monitor stream to {monitor_path}...")
+                
+                # Headers for monitor endpoint (uses Auth header, not TCS-Token)
+                monitor_headers = self._session.auth_headers()
+                monitor_headers.update({
+                    "Accept": "application/json, text/plain, */*",
+                    "Sec-Fetch-Site": "cross-site",
+                    "Sec-Fetch-Mode": "cors",
+                    "Origin": "ionic://evolution.tecnoalarm.com",
+                    # TCS-Token can be empty for monitor endpoint
+                })
+                
+                # Start the persistent monitor stream in background
+                # This will run indefinitely and be closed at logout
+                self._monitor_response = None
+                self._monitor_stream_task = asyncio.create_task(
+                    self._maintain_monitor_stream(monitor_path, monitor_headers)
+                )
+                
+                # Give the stream a moment to connect
+                await asyncio.sleep(0.5)
+                
+                # Step 3: Get SSE data to populate programs/zones/remotes
                 # The /tpstatus/sse endpoint returns Server-Sent Events with the data
-                # The HAR shows it requires ONLY Cookie auth, with Accept: text/event-stream header
-                print("[INFO] Step 2: Fetching programs/zones/remotes via /tpstatus/sse...")
+                # Must match exactly the headers the mobile app sends, or server returns 406
+                print("[INFO] Step 3: Fetching programs/zones/remotes via /tpstatus/sse...")
                 
                 sse_data = None
                 try:
+                    # Headers MUST match exactly what mobile app sends
                     sse_headers = {
                         "Accept": "text/event-stream",
-                        # NO Auth/TCS-Token headers for SSE - only Cookie
+                        "Sec-Fetch-Site": "cross-site",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Accept-Language": "it-IT,it;q=0.9",
+                        "Sec-Fetch-Mode": "cors",
+                        "Cache-Control": "no-cache",
+                        "Origin": "ionic://evolution.tecnoalarm.com",
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+                        "Connection": "keep-alive",
+                        "Pragma": "no-cache",
+                        "Sec-Fetch-Dest": "empty",
                     }
                     
+                    # SSE is streaming: server keeps connection open indefinitely
+                    # Parameter ?quick=true tells server to send data + complete the stream
+                    # Server takes ~13 seconds to send first event
+                    
+                    sse_url = self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true")
+                    print(f"[DEBUG] SSE request to {sse_url} (expect ~13s response)...")
+                    
                     async with self._session._session.get(
-                        self._session.tcs_url(f"{TCS_TP_STATUS_SSE}?quick=true"),
+                        sse_url,
                         headers=sse_headers,
-                        timeout=aiohttp.ClientTimeout(total=30),
+                        timeout=aiohttp.ClientTimeout(sock_read=30),  # 30s to get first chunk
                     ) as resp:
-                        print(f"[DEBUG] /tpstatus/sse response status: {resp.status}")
+                        print(f"[DEBUG] SSE status: {resp.status}")
+                        
                         if resp.status == 200:
-                            # Read the SSE stream
-                            # Format: data:{json}\n\ndata:{json}\n\n...
-                            full_response = await resp.text()
+                            # SSE Protocol: Server sends progress events (0→100→200)
+                            # Progress events 0-100: {"description":..., "progress": N, "programs":[],"zones":[],"remotes":[],...}
+                            # Final payload at progress=200: same structure but with full data
+                            chunk_buffer = ""
                             
-                            # Try to decode if base64
                             try:
-                                decoded = base64.b64decode(full_response).decode('utf-8')
-                            except:
-                                decoded = full_response
+                                # Use iter_chunked to read data as it arrives
+                                async for chunk in resp.content.iter_chunked(4096):
+                                    if not chunk:
+                                        continue
+                                    
+                                    chunk_text = chunk.decode('utf-8', errors='ignore')
+                                    chunk_buffer += chunk_text
+                                    
+                                    # Try to extract a complete SSE event: "data:{json}\n\n"
+                                    if '\n\n' in chunk_buffer:
+                                        events = chunk_buffer.split('\n\n')
+                                        
+                                        # Process complete events
+                                        for event_text in events[:-1]:
+                                            for line in event_text.strip().split('\n'):
+                                                if not line.startswith('data:'):
+                                                    continue
+                                                json_str = line[5:].strip()
+                                                if not json_str:
+                                                    continue
+                                                try:
+                                                    event_data = json.loads(json_str)
+                                                except json.JSONDecodeError:
+                                                    continue
+                                                
+                                                # Track progress events
+                                                progress = event_data.get('progress')
+                                                if progress is not None:
+                                                    print(f"[DEBUG] SSE progress: {progress}")
+                                                
+                                                # CRITICAL FIX (from HAR analysis):
+                                                # Final payload arrives at progress=200 (not 100!)
+                                                # At progress=200, programs/zones/remotes contain all actual data
+                                                if progress >= 200 and isinstance(event_data, dict):
+                                                    programs = event_data.get('programs', [])
+                                                    # Verify we have actual data
+                                                    if programs and len(programs) > 0:
+                                                        sse_data = event_data
+                                                        programs_count = len(sse_data.get('programs', []))
+                                                        zones_count = len(sse_data.get('zones', []))
+                                                        remotes_count = len(sse_data.get('remotes', []))
+                                                        print(f"[INFO] SSE final payload at progress={progress}: {programs_count} programs, {zones_count} zones, {remotes_count} remotes")
+                                                        break
+                                        
+                                        # Exit loop if we got data
+                                        if sse_data:
+                                            break
+                                        
+                                        # Keep incomplete event for next iteration
+                                        chunk_buffer = events[-1]
                             
-                            print(f"[DEBUG] SSE response length: {len(decoded)} bytes")
-                            
-                            # Parse SSE events - look for "data:{...}" lines
-                            # Take the last complete event which should have all data
-                            lines = decoded.split('\n')
-                            last_data = None
-                            
-                            for line in reversed(lines):
-                                line = line.strip()
-                                if line.startswith('data:'):
-                                    # Remove "data:" prefix and parse JSON
-                                    json_str = line[5:].strip()
-                                    if json_str:
-                                        try:
-                                            event_data = json.loads(json_str)
-                                            # Found complete data with programs/zones
-                                            if (event_data.get('programs') and len(event_data.get('programs', [])) > 0) or \
-                                               (event_data.get('zones') and len(event_data.get('zones', [])) > 0):
-                                                last_data = event_data
-                                                break
-                                        except json.JSONDecodeError:
-                                            continue
-                            
-                            if last_data:
-                                sse_data = last_data
-                                programs_count = len(sse_data.get('programs', []))
-                                zones_count = len(sse_data.get('zones', []))
-                                remotes_count = len(sse_data.get('remotes', []))
-                                print(f"[INFO] SSE data extracted: {programs_count} programs, {zones_count} zones, {remotes_count} remotes")
-                            else:
-                                print(f"[WARN] SSE response received but no programs/zones found")
+                            except asyncio.TimeoutError:
+                                print(f"[WARN] SSE timeout - no response from server")
                         else:
-                            print(f"[WARN] /tpstatus/sse returned {resp.status}")
+                            print(f"[WARN] SSE returned {resp.status}")
                 
                 except asyncio.TimeoutError:
-                    print(f"[WARN] /tpstatus/sse timeout after 30s - continuing with empty data")
+                    print(f"[WARN] SSE connection timeout")
                 except Exception as e:
-                    print(f"[WARN] /tpstatus/sse error: {e} - continuing with empty data")
-                
-                # Step 3: Do monitor polling calls (the app does these between SSE and second POST /tp)
-                monitor_path = f"/monitor/{type_str}.{central_sn}"
-                print(f"[DEBUG] Doing monitor polling calls to {monitor_path}...")
-                for i in range(1, 7):
-                    try:
-                        async with self._session._session.get(
-                            self._session.tcs_url(monitor_path),
-                            headers=self._session.tcs_headers(),
-                            timeout=aiohttp.ClientTimeout(total=5),
-                        ) as resp:
-                            pass  # Discard response
-                    except:
-                        pass  # Ignore errors
+                    print(f"[WARN] SSE error: {type(e).__name__}: {e}")
                 
                 # Step 4: Second POST /tp with complete data (valid_data=true)
                 # This "commits" the sync with all the programs/zones/remotes data
@@ -451,9 +614,10 @@ class TecnoalarmAuth:
                     payload['codes'] = sse_data.get('codes', [])
                     payload['keys'] = sse_data.get('keys', [])
                     payload['rcmds'] = sse_data.get('rcmds', [])
-                    # Mark as valid/synced
+                    # CONFIRMED (manual Proxyman check): 
+                    # POST /tcs/tp DOES send valid_data: true
+                    # (only GET /tcs/tps doesn't have it)
                     payload['valid_data'] = True
-                    payload['syncCRC'] = sse_data.get('syncCRC')
                     # Store program names for future reference
                     _store_program_names(sse_data.get('programs'))
                 
@@ -463,30 +627,9 @@ class TecnoalarmAuth:
                     headers=self._session.tcs_headers(),
                 ) as resp:
                     if resp.status != 200:
-                        print(f"[WARN] Second POST /tp returned {resp.status} - continuing anyway")
+                        print(f"[WARN] Second POST /tp returned {resp.status}")
                     else:
                         print(f"[INFO] Second POST /tp successful")
-                
-                # Step 5: Final monitor polling calls after second POST
-                print(f"[DEBUG] Doing final monitor polling calls...")
-                for i in range(1, 4):
-                    try:
-                        async with self._session._session.get(
-                            self._session.tcs_url(monitor_path),
-                            headers=self._session.tcs_headers(),
-                            timeout=aiohttp.ClientTimeout(total=5),
-                        ) as resp:
-                            pass  # Discard response
-                    except:
-                        pass  # Ignore errors
-                
-                # Step 6: Start background monitor polling (keepalive)
-                # This runs continuously throughout the session lifetime
-                print("[INFO] Starting background monitor polling...")
-                self._polling_active = True
-                self._polling_task = asyncio.create_task(
-                    self._start_monitor_polling(type_str, central_sn)
-                )
 
     # ---------- logout ----------
 
@@ -556,6 +699,63 @@ class TecnoalarmAuth:
         except aiohttp.ClientError as e:
             raise TecnoalarmAPIError(f"Network error during token refresh: {e}")
 
+    # ---------- persistent monitor stream (replaces polling) ----------
+
+    async def _maintain_monitor_stream(self, monitor_path: str, monitor_headers: dict) -> None:
+        """
+        Maintain a persistent streaming connection to the monitor endpoint.
+        
+        The /monitor endpoint is a SERVER-SENT EVENTS (SSE) style streaming endpoint:
+        - Client connects with GET request
+        - Server keeps connection OPEN INDEFINITELY
+        - Server continuously sends event updates over the same connection
+        - Connection stays open throughout the entire session
+        
+        This replaces the old polling model (separate requests).
+        
+        Args:
+            monitor_path: Path like "/monitor/tp042.003236056"
+            monitor_headers: Headers dict with Auth, Accept, etc.
+        """
+        monitor_url = self._session.tcs_url(monitor_path)
+        
+        print(f"[DEBUG] Starting persistent monitor stream to {monitor_path}...")
+        
+        try:
+            # Open connection with NO TIMEOUT - it stays open indefinitely
+            async with self._session._session.get(
+                monitor_url,
+                headers=monitor_headers,
+                timeout=aiohttp.ClientTimeout(total=None),  # No timeout - stays open
+            ) as resp:
+                self._monitor_response = resp
+                
+                print(f"[DEBUG] Monitor stream connected (status {resp.status})")
+                
+                if resp.status != 200:
+                    print(f"[WARN] Monitor stream returned {resp.status}")
+                    return
+                
+                # Read data continuously as it arrives from server
+                # Don't close until logout
+                try:
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if chunk:
+                            # Just receive and discard - server sends updates periodically
+                            # In the future, we could parse events if needed
+                            pass
+                except asyncio.CancelledError:
+                    print(f"[DEBUG] Monitor stream cancelled")
+                    raise
+        
+        except asyncio.CancelledError:
+            print(f"[DEBUG] Monitor stream task cancelled")
+        except Exception as e:
+            print(f"[WARN] Monitor stream error: {type(e).__name__}: {e}")
+        finally:
+            self._monitor_response = None
+            print(f"[DEBUG] Monitor stream closed")
+
     # ---------- background monitor polling (keepalive) ----------
 
     async def _start_monitor_polling(self, central_type: str, central_id: str) -> None:
@@ -603,8 +803,20 @@ class TecnoalarmAuth:
 
     async def _stop_monitor_polling(self) -> None:
         """
-        Stop the background monitor polling task.
+        Stop the monitor stream and background polling tasks.
         """
+        # Close persistent monitor stream
+        if self._monitor_stream_task:
+            try:
+                self._monitor_stream_task.cancel()
+                await self._monitor_stream_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._monitor_stream_task = None
+        
+        # Close polling task (legacy)
         if self._polling_active:
             self._polling_active = False
             
