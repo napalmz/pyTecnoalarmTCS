@@ -135,8 +135,10 @@ class TecnoalarmCentral:
         self._cache_lock = asyncio.Lock()
         
         # Streaming configuration
-        self._stream_reconnect_interval = 540  # 9 minutes (540 seconds) for program/zone/remote
-        self._monitor_reconnect_interval = 540  # 9 minutes (540 seconds) for monitor
+        # Server closes streams after ~60s, so we just need to track when to force reconnect
+        self._stream_reconnect_interval = 60  # Server timeout (~60 seconds)
+        self._monitor_reconnect_interval = 60  # Server timeout (~60 seconds)
+        self._reconnect_delay = 2  # Delay before reconnecting after stream closes
 
     # ---------- Central Info ----------
 
@@ -249,14 +251,15 @@ class TecnoalarmCentral:
     
     async def _maintain_program_stream(self) -> None:
         """
-        Maintain a persistent streaming connection to GET /tcs/program.
+        Maintain streaming connection to GET /tcs/program.
         
-        The /tcs/program endpoint uses chunked transfer encoding and keeps
-        the connection open, sending periodic updates. This method:
-        - Opens a long-lived connection
+        The server closes the stream after ~60 seconds (chunked transfer timeout).
+        This method auto-reconnects with a brief delay (2s) to maintain continuous updates,
+        matching the behavior of the official app.
+        - Opens connection
         - Reads chunks as they arrive
         - Updates the cached programs list
-        - Reconnects every 9 minutes (540 seconds)
+        - Auto-reconnects when server closes the stream
         """
         import sys
         
@@ -327,28 +330,31 @@ class TecnoalarmCentral:
                         except Exception as e:
                             print(f"[WARN] Failed to parse program chunk: {e}", file=sys.stderr)
                         
-                        # Check if we should reconnect
+                        # Check if we should force reconnect (though server typically closes at ~60s)
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._stream_reconnect_interval:
-                            print(f"[DEBUG] Program stream reconnecting after {elapsed:.1f}s", file=sys.stderr)
+                            print(f"[DEBUG] Program stream force reconnecting after {elapsed:.1f}s", file=sys.stderr)
                             break
                     
-                    # If stream ended early, wait before reconnecting
+                    # Stream ended (server closed it after ~60s), reconnect after brief delay
                     elapsed = asyncio.get_event_loop().time() - stream_start
-                    if elapsed < self._stream_reconnect_interval:
-                        remaining = self._stream_reconnect_interval - elapsed
-                        print(f"[DEBUG] Program stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
-                        await asyncio.sleep(remaining)
+                    print(f"[DEBUG] Program stream closed by server after {elapsed:.1f}s, reconnecting in {self._reconnect_delay}s", file=sys.stderr)
+                    await asyncio.sleep(self._reconnect_delay)
             
             except asyncio.CancelledError:
                 print("[DEBUG] Program stream cancelled", file=sys.stderr)
                 break
             except Exception as e:
                 print(f"[ERROR] Program stream error: {type(e).__name__}: {e}", file=sys.stderr)
-                await asyncio.sleep(10)  # Wait before retry
+                await asyncio.sleep(self._reconnect_delay)
     
     async def _maintain_zone_stream(self) -> None:
-        """Maintain persistent streaming connection to GET /tcs/zone."""
+        """
+        Maintain streaming connection to GET /tcs/zone.
+        
+        Server closes the stream after ~60 seconds.
+        Auto-reconnects with brief delay to maintain continuous updates.
+        """
         import sys
         
         while True:
@@ -431,25 +437,28 @@ class TecnoalarmCentral:
                         
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._stream_reconnect_interval:
-                            print(f"[DEBUG] Zone stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            print(f"[DEBUG] Zone stream force reconnecting after {elapsed:.0f}s", file=sys.stderr)
                             break
                     
-                    # If stream ended early, wait before reconnecting
+                    # Stream ended (server closed it), reconnect after brief delay
                     elapsed = asyncio.get_event_loop().time() - stream_start
-                    if elapsed < self._stream_reconnect_interval:
-                        remaining = self._stream_reconnect_interval - elapsed
-                        print(f"[DEBUG] Zone stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
-                        await asyncio.sleep(remaining)
+                    print(f"[DEBUG] Zone stream closed by server after {elapsed:.1f}s, reconnecting in {self._reconnect_delay}s", file=sys.stderr)
+                    await asyncio.sleep(self._reconnect_delay)
             
             except asyncio.CancelledError:
                 print("[INFO] Zone stream stopped", file=sys.stderr)
                 break
             except Exception as e:
                 print(f"[ERROR] Zone stream error: {type(e).__name__}: {e}", file=sys.stderr)
-                await asyncio.sleep(10)
+                await asyncio.sleep(self._reconnect_delay)
     
     async def _maintain_remote_stream(self) -> None:
-        """Maintain persistent streaming connection to GET /tcs/remote."""
+        """
+        Maintain streaming connection to GET /tcs/remote.
+        
+        Server closes the stream after ~60 seconds.
+        Auto-reconnects with brief delay to maintain continuous updates.
+        """
         import sys
         
         while True:
@@ -499,26 +508,27 @@ class TecnoalarmCentral:
                         
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._stream_reconnect_interval:
-                            print(f"[DEBUG] Remote stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            print(f"[DEBUG] Remote stream force reconnecting after {elapsed:.0f}s", file=sys.stderr)
                             break
                     
-                    # If stream ended early, wait before reconnecting
+                    # Stream ended (server closed it), reconnect after brief delay
                     elapsed = asyncio.get_event_loop().time() - stream_start
-                    if elapsed < self._stream_reconnect_interval:
-                        remaining = self._stream_reconnect_interval - elapsed
-                        print(f"[DEBUG] Remote stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
-                        await asyncio.sleep(remaining)
+                    print(f"[DEBUG] Remote stream closed by server after {elapsed:.1f}s, reconnecting in {self._reconnect_delay}s", file=sys.stderr)
+                    await asyncio.sleep(self._reconnect_delay)
             
             except asyncio.CancelledError:
                 print("[INFO] Remote stream stopped", file=sys.stderr)
                 break
             except Exception as e:
                 print(f"[ERROR] Remote stream error: {type(e).__name__}: {e}", file=sys.stderr)
-                await asyncio.sleep(10)
+                await asyncio.sleep(self._reconnect_delay)
     
     async def _maintain_monitor_stream(self) -> None:
         """
-        Maintain persistent streaming connection to GET /tcs/monitor.
+        Maintain streaming connection to GET /tcs/monitor.
+        
+        Server closes the stream after ~60 seconds.
+        Auto-reconnects with brief delay to maintain continuous updates.
         This is an SSE stream like /program, /zone, /remote.
         """
         import sys
@@ -577,22 +587,20 @@ class TecnoalarmCentral:
                         
                         elapsed = asyncio.get_event_loop().time() - stream_start
                         if elapsed >= self._monitor_reconnect_interval:
-                            print(f"[DEBUG] Monitor stream reconnecting after {elapsed:.0f}s", file=sys.stderr)
+                            print(f"[DEBUG] Monitor stream force reconnecting after {elapsed:.0f}s", file=sys.stderr)
                             break
                     
-                    # If stream ended early, wait before reconnecting
+                    # Stream ended (server closed it), reconnect after brief delay
                     elapsed = asyncio.get_event_loop().time() - stream_start
-                    if elapsed < self._monitor_reconnect_interval:
-                        remaining = self._monitor_reconnect_interval - elapsed
-                        print(f"[DEBUG] Monitor stream ended early, waiting {remaining:.0f}s before reconnect", file=sys.stderr)
-                        await asyncio.sleep(remaining)
+                    print(f"[DEBUG] Monitor stream closed by server after {elapsed:.1f}s, reconnecting in {self._reconnect_delay}s", file=sys.stderr)
+                    await asyncio.sleep(self._reconnect_delay)
             
             except asyncio.CancelledError:
                 print("[INFO] Monitor stream stopped", file=sys.stderr)
                 break
             except Exception as e:
                 print(f"[ERROR] Monitor stream error: {type(e).__name__}: {e}", file=sys.stderr)
-                await asyncio.sleep(10)
+                await asyncio.sleep(self._reconnect_delay)
     
     async def wait_for_streaming_ready(self, timeout: float = 10.0) -> bool:
         """
@@ -636,22 +644,22 @@ class TecnoalarmCentral:
         # Start program stream
         if self._program_stream_task is None or self._program_stream_task.done():
             self._program_stream_task = asyncio.create_task(self._maintain_program_stream())
-            print("[INFO] Program streaming started (auto-reconnect every 9 min)", file=sys.stderr)
+            print("[INFO] Program streaming started (server closes ~60s, auto-reconnect)", file=sys.stderr)
         
         # Start zone stream
         if self._zone_stream_task is None or self._zone_stream_task.done():
             self._zone_stream_task = asyncio.create_task(self._maintain_zone_stream())
-            print("[INFO] Zone streaming started (auto-reconnect every 9 min)", file=sys.stderr)
+            print("[INFO] Zone streaming started (server closes ~60s, auto-reconnect)", file=sys.stderr)
         
         # Start remote stream
         if self._remote_stream_task is None or self._remote_stream_task.done():
             self._remote_stream_task = asyncio.create_task(self._maintain_remote_stream())
-            print("[INFO] Remote streaming started (auto-reconnect every 9 min)", file=sys.stderr)
+            print("[INFO] Remote streaming started (server closes ~60s, auto-reconnect)", file=sys.stderr)
         
         # Start monitor stream
         if self._monitor_stream_task is None or self._monitor_stream_task.done():
             self._monitor_stream_task = asyncio.create_task(self._maintain_monitor_stream())
-            print("[INFO] Monitor streaming started (auto-reconnect every 540 sec)", file=sys.stderr)
+            print("[INFO] Monitor streaming started (server closes ~60s, auto-reconnect)", file=sys.stderr)
     
     async def stop_streaming(self) -> None:
         """
