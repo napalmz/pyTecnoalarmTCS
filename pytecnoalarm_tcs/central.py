@@ -136,7 +136,7 @@ class TecnoalarmCentral:
         
         # Streaming configuration
         self._stream_reconnect_interval = 540  # 9 minutes (540 seconds) for program/zone/remote
-        self._monitor_reconnect_interval = 30  # 30 seconds for monitor
+        self._monitor_reconnect_interval = 540  # 9 minutes (540 seconds) for monitor
 
     # ---------- Central Info ----------
 
@@ -495,7 +495,7 @@ class TecnoalarmCentral:
                 await asyncio.sleep(10)
     
     async def _maintain_monitor_stream(self) -> None:
-        """Maintain persistent streaming connection to GET /tcs/monitor with 30s reconnects."""
+        """Maintain persistent streaming connection to GET /tcs/monitor with 540s reconnects."""
         import sys
         
         if not self._session.central_type or not self._session.central_id:
@@ -616,7 +616,7 @@ class TecnoalarmCentral:
         # Start monitor stream
         if self._monitor_stream_task is None or self._monitor_stream_task.done():
             self._monitor_stream_task = asyncio.create_task(self._maintain_monitor_stream())
-            print("[INFO] Monitor streaming started (auto-reconnect every 30 sec)", file=sys.stderr)
+            print("[INFO] Monitor streaming started (auto-reconnect every 540 sec)", file=sys.stderr)
     
     async def stop_streaming(self) -> None:
         """
