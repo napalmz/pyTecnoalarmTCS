@@ -268,10 +268,11 @@ class TecnoalarmCentral:
                 await self._activate_central_session()
                 
                 # Open streaming connection with long timeout
+                # Use sock_read instead of total to allow long idle periods between chunks
                 async with self._session._session.get(
                     self._session.tcs_url(TCS_PROGRAM),
                     headers=self._session.tcs_headers(),
-                    timeout=aiohttp.ClientTimeout(total=self._stream_reconnect_interval + 60),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=self._stream_reconnect_interval + 60),
                 ) as resp:
                     if resp.status != 200:
                         print(f"[ERROR] Program stream failed: {resp.status}", file=sys.stderr)
@@ -359,7 +360,7 @@ class TecnoalarmCentral:
                 async with self._session._session.get(
                     self._session.tcs_url(TCS_ZONE),
                     headers=self._session.tcs_headers(),
-                    timeout=aiohttp.ClientTimeout(total=self._stream_reconnect_interval + 60),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=self._stream_reconnect_interval + 60),
                 ) as resp:
                     if resp.status != 200:
                         print(f"[ERROR] Zone stream failed: {resp.status}", file=sys.stderr)
@@ -460,7 +461,7 @@ class TecnoalarmCentral:
                 async with self._session._session.get(
                     self._session.tcs_url(TCS_REMOTE),
                     headers=self._session.tcs_headers(),
-                    timeout=aiohttp.ClientTimeout(total=self._stream_reconnect_interval + 60),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=self._stream_reconnect_interval + 60),
                 ) as resp:
                     if resp.status != 200:
                         print(f"[ERROR] Remote stream failed: {resp.status}", file=sys.stderr)
@@ -538,7 +539,7 @@ class TecnoalarmCentral:
                 async with self._session._session.get(
                     self._session.tcs_url(monitor_path),
                     headers=self._session.tcs_headers(),
-                    timeout=aiohttp.ClientTimeout(total=self._monitor_reconnect_interval + 60),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=self._monitor_reconnect_interval + 60),
                 ) as resp:
                     if resp.status != 200:
                         print(f"[ERROR] Monitor stream failed: {resp.status}", file=sys.stderr)
